@@ -1,44 +1,47 @@
-const fs = require("fs");
-const path = require("path");
+import { existsSync, mkdirSync, copyFileSync } from "node:fs";
+import { resolve, join } from "node:path";
 
-const frontend = path.resolve(__dirname, "..", "frontend");
-const source = path.join(frontend, "src");
-const dist = path.join(frontend, "dist");
+const root = resolve(import.meta.dirname, "..");
+const frontend = join(root, "frontend");
+const source = join(frontend, "src");
+const dist = join(frontend, "dist");
 
-const requiredSource = [
+const files = [
   "index.html",
   "styles.css",
   "app.js",
 ];
 
-const requiredDist = requiredSource;
-
-if (!fs.existsSync(source)) {
-  throw new Error("frontend/src is missing");
+if (!existsSync(frontend)) {
+  throw new Error("frontend directory is missing");
 }
 
-fs.mkdirSync(dist, { recursive: true });
+if (!existsSync(source)) {
+  throw new Error("frontend/src directory is missing");
+}
 
-for (const file of requiredSource) {
-  const src = path.join(source, file);
-  const dst = path.join(dist, file);
+mkdirSync(dist, { recursive: true });
 
-  if (!fs.existsSync(src)) {
+for (const file of files) {
+  const src = join(source, file);
+  const dst = join(dist, file);
+
+  if (!existsSync(src)) {
     throw new Error(`Missing frontend source file: ${src}`);
   }
 
-  fs.copyFileSync(src, dst);
+  copyFileSync(src, dst);
 }
 
-for (const file of requiredDist) {
-  const dst = path.join(dist, file);
+for (const file of files) {
+  const dst = join(dist, file);
 
-  if (!fs.existsSync(dst)) {
-    throw new Error(`Missing frontend build file: ${dst}`);
+  if (!existsSync(dst)) {
+    throw new Error(`Frontend build failed: ${dst}`);
   }
 }
 
-console.log("PASS: frontend build");
-console.log("PASS: index.html");
-console.log("PASS: styles.css");
-console.log("PASS: app.js");
+console.log("PASS: Osiri frontend build");
+console.log("PASS: frontend/dist/index.html");
+console.log("PASS: frontend/dist/styles.css");
+console.log("PASS: frontend/dist/app.js");
