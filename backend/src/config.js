@@ -52,6 +52,10 @@ export const config = {
   openaiApiKey: process.env.OPENAI_API_KEY || '',
   googleApiKey: process.env.GOOGLE_API_KEY || '',
 
+  // JEV Decision API plugin (server-side only)
+  jevApiKey: process.env.JEV_API_KEY || '',
+  jevBaseUrl: process.env.JEV_BASE_URL || 'https://jev-agent.com',
+
   // MCP tool groups
   mcpGroups: {
     agents: process.env.MCP_GROUP_AGENTS !== 'false',
@@ -77,6 +81,7 @@ export const config = {
 export const SECRET_KEYS = new Set([
   'MODEL_API_KEY', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY',
   'GOOGLE_API_KEY', 'DAVTEAM_API_TOKEN', 'MODEL_BASE_URL',
+  'JEV_API_KEY', 'JEV_BASE_URL',
 ]);
 
 export function isConfigured() {
@@ -85,5 +90,6 @@ export function isConfigured() {
     anthropic: Boolean(config.anthropicApiKey),
     openai: Boolean(config.openaiApiKey),
     google: Boolean(config.googleApiKey),
+    jev: Boolean(config.jevApiKey),
   };
 }

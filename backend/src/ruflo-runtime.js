@@ -222,6 +222,9 @@ export async function getCapabilities() {
   const configured = isConfigured();
   caps.model = configured.model || configured.anthropic || configured.openai || configured.google;
 
+  // JEV plugin capability (server-side)
+  caps.jev = configured.jev;
+
   capabilitiesCache = caps;
   return caps;
 }

@@ -10,7 +10,12 @@ import {
 import { taskManager } from './task-manager.js';
 import { executeCommand } from './command-exec.js';
 import { safePath, validateCommand, auditLog, PathValidationError, CommandValidationError } from './workspace.js';
+import { readFileSync, existsSync } from 'node:fs';
 import { listProviders, listModels, chatCompletion, ProviderError } from './provider.js';
+import {
+  listPlugins, getPlugin, jevPluginInfo, jevTools, executeJevTool, jevConfigured, JevError,
+} from './jev-plugin.js';
+import { autonomousBuilder } from './autonomous-builder.js';
 
 const router = Router();
 
@@ -242,6 +247,20 @@ router.get('/api/tools', async (req, res) => {
 router.post('/api/tools/execute', async (req, res) => {
   const { tool, args = {} } = req.body || {};
   if (!tool) return apiError(res, 'INVALID_REQUEST', 'tool is required', 400);
+
+  // JEV tools are handled by the JEV plugin (server-side credentials)
+  if (tool.startsWith('jev_')) {
+    try {
+      const result = await executeJevTool(tool, args);
+      return res.json({ tool, result });
+    } catch (err) {
+      if (err instanceof JevError) {
+        return apiError(res, err.code, err.message, err.code === 'JEV_NOT_CONFIGURED' ? 503 : 502, { details: err.details });
+      }
+      return apiError(res, 'JEV_TOOL_FAILED', err.message, 500);
+    }
+  }
+
   try {
     const cliArgs = ['mcp', 'exec', tool];
     for (const [k, v] of Object.entries(args)) {
@@ -251,6 +270,61 @@ router.post('/api/tools/execute', async (req, res) => {
     res.json(result.json || { result: result.stdout, exitCode: result.exitCode });
   } catch (err) {
     apiError(res, 'TOOL_EXECUTE_FAILED', err.message, 500);
+  }
+});
+
+// --- Plugins ---
+
+router.get('/api/plugins', (req, res) => {
+  // Never expose plugin credentials
+  res.json({ plugins: listPlugins() });
+});
+
+router.get('/api/plugins/jev', (req, res) => {
+  // Never expose the API key
+  res.json({
+    ...jevPluginInfo,
+    configured: jevConfigured,
+    tools: jevTools,
+  });
+});
+
+router.post('/api/plugins/jev/decide', async (req, res) => {
+  const { state, questions, model } = req.body || {};
+  try {
+    const result = await executeJevTool('jev_decide', { state, questions, model });
+    res.json(result);
+  } catch (err) {
+    if (err instanceof JevError) {
+      return apiError(res, err.code, err.message, err.code === 'JEV_NOT_CONFIGURED' ? 503 : 502, { details: err.details });
+    }
+    apiError(res, 'JEV_DECIDE_FAILED', err.message, 500);
+  }
+});
+
+router.post('/api/plugins/jev/classify', async (req, res) => {
+  const { ruleset, items } = req.body || {};
+  try {
+    const result = await executeJevTool('jev_classify', { ruleset, items });
+    res.json(result);
+  } catch (err) {
+    if (err instanceof JevError) {
+      return apiError(res, err.code, err.message, err.code === 'JEV_NOT_CONFIGURED' ? 503 : 502, { details: err.details });
+    }
+    apiError(res, 'JEV_CLASSIFY_FAILED', err.message, 500);
+  }
+});
+
+router.post('/api/plugins/jev/tool-guard', async (req, res) => {
+  const params = req.body || {};
+  try {
+    const result = await executeJevTool('jev_tool_guard', params);
+    res.json(result);
+  } catch (err) {
+    if (err instanceof JevError) {
+      return apiError(res, err.code, err.message, err.code === 'JEV_NOT_CONFIGURED' ? 503 : 502, { details: err.details });
+    }
+    apiError(res, 'JEV_TOOL_GUARD_FAILED', err.message, 500);
   }
 });
 
@@ -313,6 +387,21 @@ router.post('/api/test', async (req, res) => {
     res.json(task);
   } catch (err) {
     apiError(res, 'TEST_FAILED', err.message, 500);
+  }
+});
+
+// --- Read a workspace file (for visual spec / preview loading) ---
+router.get('/api/files/read', (req, res) => {
+  const { path: relPath } = req.query;
+  if (!relPath) return apiError(res, 'INVALID_REQUEST', 'path query param is required', 400);
+  try {
+    const abs = safePath(relPath);
+    if (!existsSync(abs)) return apiError(res, 'NOT_FOUND', 'File not found', 404);
+    const content = readFileSync(abs, 'utf-8');
+    res.json({ path: relPath, content, size: content.length });
+  } catch (err) {
+    if (err instanceof PathValidationError) return apiError(res, err.code, err.message, 400);
+    apiError(res, 'FILE_READ_FAILED', err.message, 500);
   }
 });
 
@@ -393,6 +482,76 @@ router.get('/api/task/stream', (req, res) => {
   };
   taskManager.on('event', onEvent);
   req.on('close', () => taskManager.off('event', onEvent));
+});
+
+// --- Autonomous builder (Osiri) ---
+
+// POST /api/autonomous/build — start an autonomous build (returns SSE stream)
+router.post('/api/autonomous/build', async (req, res) => {
+  const { prompt, sessionId } = req.body || {};
+  if (!prompt) return apiError(res, 'INVALID_REQUEST', 'prompt is required', 400);
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+
+  // Stream events as they happen
+  const onEvent = (event) => {
+    res.write(`data: ${JSON.stringify(event)}\n\n`);
+  };
+
+  try {
+    const task = await autonomousBuilder.build({
+      prompt,
+      sessionId: sessionId || 'default',
+      onEvent,
+      signal: null,
+      maxFixIterations: 3,
+    });
+    res.write(`event: close\ndata: ${JSON.stringify({ type: 'stream.closed', status: task.status, result: task.result, error: task.error })}\n\n`);
+  } catch (err) {
+    res.write(`event: close\ndata: ${JSON.stringify({ type: 'stream.closed', status: 'failed', error: err.message })}\n\n`);
+  }
+  res.end();
+});
+
+// POST /api/autonomous/build/sync — start an autonomous build (returns JSON result)
+router.post('/api/autonomous/build/sync', async (req, res) => {
+  const { prompt, sessionId } = req.body || {};
+  if (!prompt) return apiError(res, 'INVALID_REQUEST', 'prompt is required', 400);
+
+  try {
+    const task = await autonomousBuilder.build({
+      prompt,
+      sessionId: sessionId || 'default',
+      onEvent: null,
+      signal: null,
+      maxFixIterations: 3,
+    });
+    res.json(task);
+  } catch (err) {
+    apiError(res, 'AUTONOMOUS_BUILD_FAILED', err.message, 500);
+  }
+});
+
+// GET /api/autonomous/plan — preview the plan for a prompt without executing
+router.post('/api/autonomous/plan', (req, res) => {
+  const { prompt } = req.body || {};
+  if (!prompt) return apiError(res, 'INVALID_REQUEST', 'prompt is required', 400);
+  try {
+    const plan = autonomousBuilder.createPlan(prompt);
+    res.json({
+      projectName: plan.projectName,
+      projectType: plan.projectType,
+      summary: plan.summary,
+      files: plan.files.map(f => ({ path: f.path, size: f.content.length })),
+      buildCommand: plan.buildCommand,
+      testCommand: plan.testCommand,
+    });
+  } catch (err) {
+    apiError(res, 'PLAN_FAILED', err.message, 500);
+  }
 });
 
 // --- Error handler for unknown routes ---
