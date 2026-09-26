@@ -18,6 +18,7 @@ import {
 import { autonomousBuilder } from './autonomous-builder.js';
 import { taskStore } from './task-store.js';
 import { getTaskStatusSummary, handleFailure, resumeFromCheckpoint } from './resilience.js';
+import { voice } from './voice.js';
 
 const router = Router();
 
@@ -722,65 +723,109 @@ router.post('/api/tasks/:taskId/retry', async (req, res) => {
 });
 
 // POST /api/tasks/:taskId/conversation — conversation during build
-// User can ask "what are you doing?" and get a real state-based response
+// Uses Osiri personality module — calm, natural, human responses from real task state.
+// This is the conversation channel — separate from the task channel. A conversation
+// must NOT accidentally terminate the build.
 router.post('/api/tasks/:taskId/conversation', (req, res) => {
   const { message } = req.body || {};
   const taskId = req.params.taskId;
   const task = taskStore.getTask(taskId);
   if (!task) return apiError(res, 'NOT_FOUND', 'Task not found', 404);
 
-  const msg = (message || '').toLowerCase();
-  let response = '';
+  // Use the Osiri personality module for natural responses from real task state
+  const result = autonomousBuilder.converse(taskId, message || '');
+  const response = result.response;
 
-  if (/what are you doing|status|how far|progress|what's happening/.test(msg)) {
-    const summary = getTaskStatusSummary(taskId);
-    response = summary.summary;
-  } else if (/stop|cancel|abort/.test(msg)) {
-    taskStore.cancel(taskId, 'user-request');
-    response = 'I have stopped the current task. The task state has been saved.';
-  } else if (/pause|wait|hold/.test(msg)) {
-    taskStore.checkpoint(taskId, { reason: 'user-pause' });
-    taskStore.pause(taskId);
-    response = 'I have paused the current task. You can resume by saying "continue".';
-  } else if (/continue|resume|go on|keep going/.test(msg)) {
-    taskStore.resume(taskId);
-    response = 'I am resuming the task from where it was paused.';
-    // Restart in background
-    if (task.goal) {
-      autonomousBuilder.build({
-        prompt: task.goal, sessionId: task.sessionId, onEvent: null, taskId, maxFixIterations: 3,
-      }).catch(err => logger.error('conversation.resume.failed', { taskId, error: err.message }));
-    }
-  } else if (/change|modify|update|use|switch|different/.test(msg)) {
-    // User wants to modify the build — store as a note
-    taskStore.emitEvent(taskId, { type: 'user.modification', message });
-    response = `Understood. I'll incorporate "${message}" into the current build. The change will be applied when appropriate.`;
-  } else if (/error|fail|wrong|broken/.test(msg)) {
-    response = task.lastError
-      ? `The last error was: ${task.lastError}. Failure type: ${task.failureClassification || 'UNKNOWN'}. Retry count: ${task.retryCount}/${task.maxRetries}.`
-      : 'No errors have been recorded for this task.';
-  } else if (/file|what files|show files/.test(msg)) {
-    const files = task.filesCreated || [];
-    response = files.length > 0
-      ? `I have created ${files.length} files so far: ${files.slice(0, 10).join(', ')}${files.length > 10 ? '...' : ''}`
-      : 'No files have been created yet.';
-  } else if (/test/.test(msg)) {
-    response = task.testResult
-      ? `Tests ${task.testResult.exitCode === 0 ? 'passed' : 'failed'} (exit code ${task.testResult.exitCode}).`
-      : 'Tests have not been run yet.';
-  } else if (/build/.test(msg)) {
-    response = task.buildResult
-      ? `Build ${task.buildResult.exitCode === 0 ? 'succeeded' : 'failed'} (exit code ${task.buildResult.exitCode}).`
-      : 'Build has not been run yet.';
-  } else {
-    const summary = getTaskStatusSummary(taskId);
-    response = `${summary.summary} You can ask me about progress, files, build status, or tell me to pause/stop/continue.`;
-  }
-
-  taskStore.emitEvent(taskId, { type: 'conversation', role: 'user', message });
+  taskStore.emitEvent(taskId, { type: 'conversation', role: 'user', message: message || '' });
   taskStore.emitEvent(taskId, { type: 'conversation', role: 'osiri', message: response });
 
   res.json({ taskId, response, taskStatus: task.status, phase: task.phase });
+});
+
+// POST /api/tasks/:taskId/interrupt — Osiri interrupts an agent
+// Stops an agent when: repeated failures, scope violations, looping, budget limits
+router.post('/api/tasks/:taskId/interrupt', (req, res) => {
+  const { reason } = req.body || {};
+  const taskId = req.params.taskId;
+  const task = taskStore.getTask(taskId);
+  if (!task) return apiError(res, 'NOT_FOUND', 'Task not found', 404);
+
+  const result = autonomousBuilder.interruptAgent(taskId, reason || 'user-requested interruption');
+  res.json({ taskId, ...result, message: result.success ? 'Agent interrupted. State preserved.' : result.reason });
+});
+
+// POST /api/tasks/:taskId/resume-agent — resume an interrupted agent
+router.post('/api/tasks/:taskId/resume-agent', (req, res) => {
+  const taskId = req.params.taskId;
+  const task = taskStore.getTask(taskId);
+  if (!task) return apiError(res, 'NOT_FOUND', 'Task not found', 404);
+
+  const result = autonomousBuilder.resumeAgent(taskId);
+  res.json({ taskId, ...result, message: result.success ? `Agent resumed from phase: ${result.phase}` : result.reason });
+
+  // Restart the build in the background if resuming
+  if (result.success && task.goal) {
+    autonomousBuilder.build({
+      prompt: task.goal, sessionId: task.sessionId, onEvent: null, taskId, maxFixIterations: 3,
+    }).catch(err => logger.error('resume-agent.build.failed', { taskId, error: err.message }));
+  }
+});
+
+// --- Voice / TTS routes (server-side credentials only) ---
+
+// GET /api/voice/status — check if voice/TTS is available
+router.get('/api/voice/status', (req, res) => {
+  res.json({
+    available: voice.isVoiceAvailable(),
+    provider: config.ttsProvider,
+    voices: [],
+  });
+});
+
+// GET /api/voice/voices — list available voices
+router.get('/api/voice/voices', async (req, res) => {
+  try {
+    const result = await voice.getVoices();
+    res.json(result);
+  } catch (err) {
+    apiError(res, 'VOICE_VOICES_FAILED', err.message, 500);
+  }
+});
+
+// POST /api/voice/speak — synthesize speech from text
+// Credentials stay server-side. Only audio bytes (or a web-speech signal) are returned.
+router.post('/api/voice/speak', async (req, res) => {
+  const { text, voice, speed, pitch, format } = req.body || {};
+  if (!text) return apiError(res, 'INVALID_REQUEST', 'text is required', 400);
+
+  try {
+    const result = await voice.synthesize(text, { voice, speed, pitch, format });
+    if (result.available && result.audio) {
+      // Return audio bytes
+      res.setHeader('Content-Type', `audio/${result.format || 'mp3'}`);
+      res.send(result.audio);
+    } else if (result.available && result.format === 'web-speech') {
+      // Return a signal for the browser to use its own Web Speech API
+      res.json({
+        available: true,
+        format: 'web-speech',
+        text: result.text || text,
+        voice: result.voice,
+        speed: result.speed,
+        pitch: result.pitch,
+      });
+    } else {
+      res.json(result); // { available: false, reason: ... }
+    }
+  } catch (err) {
+    apiError(res, 'VOICE_SYNTHESIS_FAILED', err.message, 500);
+  }
+});
+
+// POST /api/voice/stop — stop speech (interruption signal)
+router.post('/api/voice/stop', (req, res) => {
+  const result = voice.stopSpeech();
+  res.json(result);
 });
 
 // --- Error handler for unknown routes ---

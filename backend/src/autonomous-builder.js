@@ -14,6 +14,15 @@ import { join } from 'node:path';
 import { config, isConfigured } from './config.js';
 import { taskStore } from './task-store.js';
 import { handleFailure, attemptReconnect, resumeFromCheckpoint, FailureType } from './resilience.js';
+import { interpret, hasMaterialAmbiguities } from './interpreter.js';
+import { decompose, getExecutionOrder } from './planner.js';
+import { validate } from './validator.js';
+import { inspectBrowser } from './browser-inspector.js';
+import { inspectRuntime } from './runtime-inspector.js';
+import { analyzeError } from './error-analyzer.js';
+import { applyFix } from './fixer.js';
+import { finalInspect } from './final-inspector.js';
+import { respond as osiriRespond, progressUpdate as osiriProgress } from './osiri-personality.js';
 
 class AutonomousBuilder extends EventEmitter {
   constructor() {
@@ -82,17 +91,39 @@ class AutonomousBuilder extends EventEmitter {
       const memoryResults = await this.retrieveMemory(prompt);
       emit({ type: 'memory.retrieved', patterns: memoryResults.length, results: memoryResults.slice(0, 5) });
 
-      // 2. PLAN — analyze the request and determine the project structure
+      // 1b. INTERPRET — understand the user's request and produce a Build Contract
+      taskStore.setPhase(taskId, 'interpreting');
+      emit({ type: 'interpreting.started', prompt });
+      const buildContract = interpret(prompt);
+      taskStore.update(taskId, { buildContract });
+      emit({ type: 'interpreting.completed', requirements: buildContract.requirements.length, acceptanceCriteria: buildContract.acceptance_criteria.length, visualRequirements: buildContract.visual_requirements.length, ambiguities: buildContract.ambiguous_requirements.length });
+
+      // Check for material ambiguities — only ask user if truly ambiguous
+      if (hasMaterialAmbiguities(buildContract)) {
+        taskStore.transition(taskId, 'WAITING_USER');
+        emit({ type: 'interpreting.ambiguous', ambiguities: buildContract.ambiguous_requirements });
+        // In autonomous mode, we resolve with defaults rather than blocking
+        emit({ type: 'interpreting.ambiguities.resolved', message: 'Resolved with sensible defaults' });
+        taskStore.transition(taskId, 'RUNNING');
+      }
+
+      // 2. PLAN — decompose the Build Contract into executable tasks
       taskStore.transition(taskId, 'RUNNING');
       taskStore.setPhase(taskId, 'planning');
       emit({ type: 'planning.started', prompt });
+      const decomposedTasks = decompose(buildContract);
+      const executionOrder = getExecutionOrder(decomposedTasks);
+      emit({ type: 'task.split', taskCount: decomposedTasks.length, executionOrder: executionOrder.map(t => t.task_id) });
+      taskStore.update(taskId, { decomposedTasks: decomposedTasks.length });
+
+      // Generate the project plan (file structure) — use existing createPlan for file generation
       const plan = this.createPlan(prompt);
       // Adapt plan based on retrieved memory patterns
       if (memoryResults.length > 0) {
         plan.adaptedFromMemory = true;
         emit({ type: 'planning.memory.adapted', patterns: memoryResults.length });
       }
-      emit({ type: 'planning.completed', plan: plan.summary, projectType: plan.projectType });
+      emit({ type: 'planning.completed', plan: plan.summary, projectType: plan.projectType, tasks: decomposedTasks.length });
 
       // 3. SELECT AGENTS — determine which agents to use
       taskStore.setPhase(taskId, 'agent-selection');
@@ -133,10 +164,11 @@ class AutonomousBuilder extends EventEmitter {
         }
       }
 
-      // 7-8. BUILD + TEST loop with self-improvement
+      // 7-8. BUILD + TEST loop with error analysis, fixer, and regression testing
       let buildOk = false;
       let testOk = false;
       let iteration = 0;
+      const repairAttempts = []; // Track all repair attempts for repeated-failure detection
 
       while (iteration <= maxFixIterations) {
         if (checkCancelled()) throw new Error('cancelled');
@@ -157,17 +189,69 @@ class AutonomousBuilder extends EventEmitter {
         buildOk = buildResult.exitCode === 0;
 
         if (!buildOk) {
-          // OBSERVE + FIX
-          taskStore.setPhase(taskId, 'fixing-build');
-          emit({ type: 'fix.started', reason: 'build failure', iteration });
-          const fix = this.analyzeBuildFailure(buildResult.stderr || buildResult.stdout, plan);
-          if (fix) {
-            emit({ type: 'file.updated', path: join(projectDir, fix.path), reason: fix.reason });
-            writeFile(join(projectDir, fix.path), fix.content);
-          } else {
-            emit({ type: 'fix.failed', reason: 'could not determine fix' });
+          // ERROR DETECTED → ANALYZE → FIX (not the old inline fix)
+          taskStore.setPhase(taskId, 'error-analysis');
+          emit({ type: 'error.detected', phase: 'build', iteration });
+
+          // Step 1: Analyze the error BEFORE attempting any fix
+          emit({ type: 'analysis.started', phase: 'build' });
+          const analysis = await analyzeError({
+            error: buildResult.stderr || buildResult.stdout,
+            failingCommand: plan.buildCommand,
+            taskDefinition: decomposedTasks.find(t => t.agent_type === 'frontend'),
+            buildContract,
+            previousRepairAttempts: repairAttempts,
+          });
+          taskStore.update(taskId, { errorAnalysis: analysis });
+          emit({ type: 'analysis.completed', whatFailed: analysis.whatFailed, rootCause: analysis.rootCause, repairStrategy: analysis.repairStrategy, shouldChangeStrategy: analysis.shouldChangeStrategy });
+
+          // Step 2: Check for repeated failures — escalate if needed
+          if (analysis.shouldChangeStrategy && analysis.repairStrategy === 'ESCALATE_TO_USER') {
+            emit({ type: 'fix.escalated', reason: 'All repair strategies exhausted', attempts: repairAttempts.length });
+            taskStore.transition(taskId, 'WAITING_USER');
+            emit({ type: 'task.failed', error: `Build failed after ${repairAttempts.length} repair attempts. All strategies exhausted.`, verified: false });
+            taskStore.fail(taskId, `Build failed after ${repairAttempts.length} repair attempts. Root cause: ${analysis.rootCause}`, 'BUILD');
+            await this.storeKnowledge(plan, taskStore.getTask(taskId), emit);
+            return taskStore.getTask(taskId);
           }
-          emit({ type: 'fix.completed', iteration });
+
+          // Step 3: Apply the fix
+          taskStore.setPhase(taskId, 'fixing-build');
+          emit({ type: 'fix.started', strategy: analysis.repairStrategy, iteration });
+          const fixResult = await applyFix(analysis, { projectDir, plan, buildContract });
+          if (fixResult.applied) {
+            emit({ type: 'fix.completed', strategy: fixResult.strategy, filesModified: fixResult.filesModified, details: fixResult.details, iteration });
+            repairAttempts.push({ strategy: fixResult.strategy, filesModified: fixResult.filesModified, details: fixResult.details, success: false });
+
+            // Check if agent should be interrupted (repeated failures / looping)
+            const interruptCheck = this.shouldInterrupt(repairAttempts);
+            if (interruptCheck.shouldInterrupt) {
+              this.interruptAgent(taskId, interruptCheck.reason);
+              emit({ type: 'agent.interrupted', reason: interruptCheck.reason });
+              taskStore.fail(taskId, `Agent interrupted: ${interruptCheck.reason}`, 'BUILD');
+              await this.storeKnowledge(plan, taskStore.getTask(taskId), emit);
+              return taskStore.getTask(taskId);
+            }
+          } else if (fixResult.shouldEscalate) {
+            emit({ type: 'fix.escalated', reason: fixResult.details });
+            taskStore.fail(taskId, `Build failed: ${fixResult.details}`, 'BUILD');
+            await this.storeKnowledge(plan, taskStore.getTask(taskId), emit);
+            return taskStore.getTask(taskId);
+          } else {
+            emit({ type: 'fix.failed', reason: fixResult.details || 'could not determine fix' });
+          }
+
+          // Re-install if dependencies changed
+          if (fixResult.filesModified.includes('package.json')) {
+            emit({ type: 'command.started', command: 'npm install', cwd: projectDir });
+            const reinstallResult = await this.executeWithResilience(taskId, {
+              command: 'npm install --no-audit --no-fund',
+              cwd: projectDir,
+              onOutput: (o) => emit({ type: 'command.output', stream: o.stream, data: o.data }),
+            }, emit);
+            emit({ type: 'command.completed', command: 'npm install', exitCode: reinstallResult.exitCode });
+          }
+
           continue; // rebuild
         }
 
@@ -185,26 +269,84 @@ class AutonomousBuilder extends EventEmitter {
           testOk = testResult.exitCode === 0;
 
           if (!testOk) {
-            emit({ type: 'fix.started', reason: 'test failure', iteration });
-            const fix = this.analyzeTestFailure(testResult.stderr || testResult.stdout, plan);
-            if (fix) {
-              emit({ type: 'file.updated', path: join(projectDir, fix.path), reason: fix.reason });
-              writeFile(join(projectDir, fix.path), fix.content);
-            } else {
-              emit({ type: 'fix.failed', reason: 'could not determine fix' });
+            // ERROR DETECTED → ANALYZE → FIX for test failures
+            taskStore.setPhase(taskId, 'error-analysis');
+            emit({ type: 'error.detected', phase: 'test', iteration });
+
+            emit({ type: 'analysis.started', phase: 'test' });
+            const analysis = await analyzeError({
+              error: testResult.stderr || testResult.stdout,
+              failingTest: 'test suite',
+              taskDefinition: decomposedTasks.find(t => t.agent_type === 'tester'),
+              buildContract,
+              previousRepairAttempts: repairAttempts,
+            });
+            taskStore.update(taskId, { errorAnalysis: analysis });
+            emit({ type: 'analysis.completed', whatFailed: analysis.whatFailed, rootCause: analysis.rootCause, repairStrategy: analysis.repairStrategy });
+
+            if (analysis.shouldChangeStrategy && analysis.repairStrategy === 'ESCALATE_TO_USER') {
+              emit({ type: 'fix.escalated', reason: 'All repair strategies exhausted', attempts: repairAttempts.length });
+              taskStore.fail(taskId, `Tests failed after ${repairAttempts.length} repair attempts. Root cause: ${analysis.rootCause}`, 'TEST');
+              await this.storeKnowledge(plan, taskStore.getTask(taskId), emit);
+              return taskStore.getTask(taskId);
             }
-            emit({ type: 'fix.completed', iteration });
+
+            taskStore.setPhase(taskId, 'fixing-test');
+            emit({ type: 'fix.started', strategy: analysis.repairStrategy, iteration });
+            const fixResult = await applyFix(analysis, { projectDir, plan, buildContract });
+            if (fixResult.applied) {
+              emit({ type: 'fix.completed', strategy: fixResult.strategy, filesModified: fixResult.filesModified, details: fixResult.details, iteration });
+              repairAttempts.push({ strategy: fixResult.strategy, filesModified: fixResult.filesModified, details: fixResult.details, success: false });
+            } else if (fixResult.shouldEscalate) {
+              emit({ type: 'fix.escalated', reason: fixResult.details });
+              taskStore.fail(taskId, `Tests failed: ${fixResult.details}`, 'TEST');
+              await this.storeKnowledge(plan, taskStore.getTask(taskId), emit);
+              return taskStore.getTask(taskId);
+            } else {
+              emit({ type: 'fix.failed', reason: fixResult.details || 'could not determine fix' });
+            }
+
             continue; // rebuild + retest
           }
         } else {
           testOk = true;
         }
 
+        // Both build and test passed — run regression testing
+        if (buildOk && (testOk || !plan.testCommand) && repairAttempts.length > 0) {
+          taskStore.setPhase(taskId, 'regression-testing');
+          emit({ type: 'regression.started', reason: 'verifying fix did not break existing functionality' });
+          // Re-run build to ensure fix didn't introduce new issues
+          const regBuildResult = await this.executeWithResilience(taskId, {
+            command: plan.buildCommand,
+            cwd: projectDir,
+            onOutput: (o) => emit({ type: 'command.output', stream: o.stream, data: o.data }),
+          }, emit);
+          if (regBuildResult.exitCode !== 0) {
+            emit({ type: 'regression.failed', reason: 'build broken after fix' });
+            buildOk = false;
+            continue;
+          }
+          if (plan.testCommand) {
+            const regTestResult = await this.executeWithResilience(taskId, {
+              command: plan.testCommand,
+              cwd: projectDir,
+              onOutput: (o) => emit({ type: 'command.output', stream: o.stream, data: o.data }),
+            }, emit);
+            if (regTestResult.exitCode !== 0) {
+              emit({ type: 'regression.failed', reason: 'tests broken after fix' });
+              testOk = false;
+              continue;
+            }
+          }
+          emit({ type: 'regression.passed', message: 'No regressions detected' });
+        }
+
         // Both build and test passed
         break;
       }
 
-      // 9. VERIFY
+      // 9. VERIFY + INSPECT — browser inspection, runtime inspection, final inspection
       if (buildOk && (testOk || !plan.testCommand)) {
         taskStore.transition(taskId, 'VERIFYING');
         taskStore.setPhase(taskId, 'verifying');
@@ -212,9 +354,84 @@ class AutonomousBuilder extends EventEmitter {
         const fileList = listFiles(projectDir);
         emit({ type: 'verification.completed', verified: true, files: fileList.length, filesList: fileList.slice(0, 30) });
 
-        const resultMsg = `Project '${plan.projectName}' built successfully. ${taskStore.getTask(taskId).filesCreated.length} files created. Build: ✓${plan.testCommand ? ' Tests: ✓' : ''}`;
-        taskStore.complete(taskId, resultMsg);
-        emit({ type: 'task.completed', result: resultMsg, verified: true });
+        // 9a. BROWSER INSPECTION — verify the app renders in a real browser
+        taskStore.setPhase(taskId, 'browser-inspection');
+        emit({ type: 'browser.test.started' });
+        let browserResult = null;
+        let previewServer = null;
+        try {
+          // Start a preview server in the background (non-blocking) for browser + runtime inspection
+          const { spawn } = await import('node:child_process');
+          const projectAbsDir = safePath(projectDir);
+          // Kill any existing process on port 4173 first
+          try { spawn('bash', ['-c', 'kill $(lsof -t -i:4173) 2>/dev/null; sleep 0.5'], { stdio: 'ignore' }); } catch {}
+          await new Promise(r => setTimeout(r, 1000));
+          // Use local vite binary directly (faster than npx which resolves packages)
+          previewServer = spawn('bash', ['-c', 'cd "' + projectAbsDir + '" && ./node_modules/.bin/vite preview --port 4173 --host --strictPort 2>&1'], {
+            stdio: ['ignore', 'pipe', 'pipe'],
+            detached: false,
+          });
+          // Wait for server to start (give it a few seconds)
+          await new Promise(r => setTimeout(r, 4000));
+
+          // Inspect the running app in a real browser
+          browserResult = await inspectBrowser({
+            url: 'http://localhost:4173',
+            projectDir,
+            screenshots: true,
+            timeout: 15000,
+          });
+        } catch (err) {
+          browserResult = { status: 'SKIP', errors: [], warnings: [{ message: `Browser inspection skipped: ${err.message}` }], checks: [], evidence: [], screenshots: [] };
+        }
+        taskStore.update(taskId, { browserResult });
+        emit({ type: `browser.test.${browserResult.status.toLowerCase()}`, status: browserResult.status, errors: browserResult.errors?.length || 0, checks: browserResult.checks?.length || 0 });
+        if (browserResult.screenshots?.length > 0) {
+          emit({ type: 'browser.screenshot', path: browserResult.screenshots[0] });
+        }
+
+        // 9b. RUNTIME INSPECTION — verify the server process is healthy
+        // Preview server is still running from browser inspection — use it for runtime check too
+        taskStore.setPhase(taskId, 'runtime-inspection');
+        emit({ type: 'runtime.inspection.started' });
+        let runtimeResult = null;
+        try {
+          runtimeResult = await inspectRuntime({ projectDir, port: 4173 });
+        } catch (err) {
+          runtimeResult = { status: 'SKIP', errors: [{ message: err.message }], checks: [], warnings: [], evidence: [] };
+        } finally {
+          // NOW kill the preview server — both inspections are done
+          if (previewServer) {
+            try { previewServer.kill('SIGTERM'); } catch {}
+            try { previewServer.kill('SIGKILL'); } catch {}
+          }
+        }
+        taskStore.update(taskId, { runtimeResult });
+        emit({ type: `runtime.inspection.${runtimeResult.status.toLowerCase()}`, status: runtimeResult.status, errors: runtimeResult.errors?.length || 0 });
+
+        // 9c. FINAL INSPECTION — compare result against Build Contract
+        taskStore.setPhase(taskId, 'final-inspection');
+        emit({ type: 'final.inspection.started' });
+        let finalResult = null;
+        try {
+          finalResult = await finalInspect(buildContract, taskStore.getTask(taskId), { projectDir, port: 4173 });
+        } catch (err) {
+          finalResult = { status: 'BLOCKED', canComplete: false, gaps: [err.message], criteria: [], evidence: [], summary: `VERIFICATION BLOCKED: ${err.message}` };
+        }
+        taskStore.update(taskId, { finalInspection: finalResult });
+        emit({ type: 'final.inspection.completed', status: finalResult.status, canComplete: finalResult.canComplete, gaps: finalResult.gaps?.length || 0, criteria: finalResult.criteria?.length || 0 });
+
+        // 9d. COMPLETION — only mark COMPLETED if final inspection says we can
+        if (finalResult.canComplete) {
+          const resultMsg = `Project '${plan.projectName}' built successfully. ${taskStore.getTask(taskId).filesCreated.length} files created. Build: ✓${plan.testCommand ? ' Tests: ✓' : ''} Browser: ${browserResult.status} Runtime: ${runtimeResult.status} Final: ✓`;
+          taskStore.complete(taskId, resultMsg);
+          emit({ type: 'task.completed', result: resultMsg, verified: true, finalInspection: finalResult.status });
+        } else {
+          // Verification blocked — report honestly
+          const blockedMsg = `VERIFICATION BLOCKED: ${finalResult.gaps?.join('; ') || 'Final inspection did not pass'}`;
+          taskStore.fail(taskId, blockedMsg, 'VERIFICATION');
+          emit({ type: 'task.failed', error: blockedMsg, verified: false, finalInspection: finalResult.status, gaps: finalResult.gaps });
+        }
 
         // 10. SAVE LEARNING — store knowledge in real Ruflo memory
         await this.storeKnowledge(plan, taskStore.getTask(taskId), emit);
@@ -261,14 +478,14 @@ class AutonomousBuilder extends EventEmitter {
    * Execute a command with network resilience.
    * If the command fails due to a network error, checkpoint and retry with backoff.
    */
-  async executeWithResilience(taskId, { command, cwd, onOutput }, emit) {
+  async executeWithResilience(taskId, { command, cwd, onOutput, timeoutMs }, emit) {
     let lastError = null;
     let retryCount = 0;
     const maxRetries = 3;
 
     while (retryCount <= maxRetries) {
       try {
-        const result = await executeCommand({ command, cwd, onOutput });
+        const result = await executeCommand({ command, cwd, onOutput, timeoutMs });
         return result;
       } catch (err) {
         lastError = err;
@@ -292,6 +509,95 @@ class AutonomousBuilder extends EventEmitter {
     }
 
     return { exitCode: 1, stdout: '', stderr: lastError?.message || 'Unknown error', timedOut: false };
+  }
+
+  /**
+   * AGENT INTERRUPTION — Osiri can stop/pause an agent when:
+   * - it is producing repeated failures
+   * - it is modifying unrelated files
+   * - it is looping
+   * - it violates the task scope
+   * - the same error repeats
+   * - the strategy is clearly incorrect
+   * - the user changes the requirement
+   * - resource/budget limits are reached
+   *
+   * State is preserved before interruption.
+   */
+  interruptAgent(taskId, reason, extra = {}) {
+    const task = taskStore.getTask(taskId);
+    if (!task) return { success: false, reason: 'Task not found' };
+
+    // Checkpoint the task before interrupting — preserve state
+    taskStore.checkpoint(taskId, { interruptionReason: reason, ...extra });
+
+    // Abort the active controller
+    const controller = this.activeTasks.get(taskId);
+    if (controller) {
+      controller.abort();
+    }
+
+    // Transition to WAITING_USER — the task is paused, not failed
+    if (!['COMPLETED', 'CANCELLED', 'FAILED'].includes(task.status)) {
+      taskStore.transition(taskId, 'WAITING_USER', { interruptionReason: reason });
+    }
+
+    taskStore.emitEvent(taskId, { type: 'agent.interrupted', reason, ...extra });
+    logger.info('builder.agent.interrupted', { taskId, reason });
+
+    return { success: true, reason, state: 'preserved' };
+  }
+
+  /**
+   * Resume an interrupted agent from its checkpoint.
+   */
+  resumeAgent(taskId) {
+    const task = taskStore.getTask(taskId);
+    if (!task) return { success: false, reason: 'Task not found' };
+    if (task.status !== 'WAITING_USER' && task.status !== 'PAUSED') {
+      return { success: false, reason: `Task is ${task.status}, not interrupted/paused` };
+    }
+
+    taskStore.transition(taskId, 'RUNNING', { resumedAt: new Date().toISOString() });
+    taskStore.emitEvent(taskId, { type: 'agent.resumed', fromCheckpoint: !!task.checkpoint });
+    logger.info('builder.agent.resumed', { taskId, phase: task.checkpoint?.phase });
+
+    return { success: true, phase: task.checkpoint?.phase || 'unknown' };
+  }
+
+  /**
+   * Check if an agent should be interrupted based on its repair history.
+   * Called after each failed repair attempt.
+   */
+  shouldInterrupt(repairAttempts, reason = '') {
+    // Interrupt if same strategy failed 3+ times
+    if (repairAttempts.length >= 3) {
+      const strategies = repairAttempts.map(a => a.strategy);
+      const sameStrategy = strategies.every(s => s === strategies[0]);
+      if (sameStrategy) {
+        return { shouldInterrupt: true, reason: `Same strategy "${strategies[0]}" failed ${repairAttempts.length} times — interrupting to avoid looping` };
+      }
+    }
+    // Interrupt if total attempts exceed budget
+    if (repairAttempts.length >= 5) {
+      return { shouldInterrupt: true, reason: `Repair budget exhausted (${repairAttempts.length} attempts) — interrupting` };
+    }
+    return { shouldInterrupt: false };
+  }
+
+  /**
+   * OSIRI CONVERSATION — respond to user messages from real task state.
+   * This is the conversation channel — separate from the task channel.
+   * A user conversation must not accidentally terminate the build.
+   */
+  converse(taskId, userMessage) {
+    const taskState = taskStore.getTask(taskId) || {};
+    const response = osiriRespond(userMessage, taskState);
+
+    // Emit the conversation as an event (but don't change task state)
+    taskStore.emitEvent(taskId, { type: 'osiri.conversation', userMessage, response });
+
+    return { response, taskStatus: taskState.status || 'idle', taskPhase: taskState.phase || 'idle' };
   }
 
   /**

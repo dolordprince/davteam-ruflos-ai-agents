@@ -56,6 +56,11 @@ export const config = {
   jevApiKey: process.env.JEV_API_KEY || '',
   jevBaseUrl: process.env.JEV_BASE_URL || 'https://jev-agent.com',
 
+  // Voice/TTS (server-side only — never exposed to browser)
+  ttsProvider: process.env.TTS_PROVIDER || 'browser',
+  ttsApiKey: process.env.TTS_API_KEY || '',
+  ttsVoice: process.env.TTS_VOICE || 'alloy',
+
   // MCP tool groups
   mcpGroups: {
     agents: process.env.MCP_GROUP_AGENTS !== 'false',
@@ -81,7 +86,7 @@ export const config = {
 export const SECRET_KEYS = new Set([
   'MODEL_API_KEY', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY',
   'GOOGLE_API_KEY', 'DAVTEAM_API_TOKEN', 'MODEL_BASE_URL',
-  'JEV_API_KEY', 'JEV_BASE_URL',
+  'JEV_API_KEY', 'JEV_BASE_URL', 'TTS_API_KEY',
 ]);
 
 export function isConfigured() {
