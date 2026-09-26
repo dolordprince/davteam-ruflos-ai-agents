@@ -22,7 +22,8 @@
     "cors": "^2.8.5",
     "express-rate-limit": ">=8.4.1",
     "helmet": "^7.2.0",
-    "ws": ">=8.21.0"
+    "ws": ">=8.21.0",
+    "playwright": "^1.48.0"
   },
   "author": "DavTeam",
   "license": "MIT",

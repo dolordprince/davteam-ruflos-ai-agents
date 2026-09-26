@@ -221,7 +221,9 @@ class AutonomousBuilder extends EventEmitter {
           const fixResult = await applyFix(analysis, { projectDir, plan, buildContract });
           if (fixResult.applied) {
             emit({ type: 'fix.completed', strategy: fixResult.strategy, filesModified: fixResult.filesModified, details: fixResult.details, iteration });
-            repairAttempts.push({ strategy: fixResult.strategy, filesModified: fixResult.filesModified, details: fixResult.details, success: false });
+            // HARDENING: Track BOTH strategy and repairStrategy so error-analyzer's
+            // selectDifferentStrategy() can compare previous attempts and never blindly retry.
+            repairAttempts.push({ strategy: fixResult.strategy, repairStrategy: fixResult.strategy, filesModified: fixResult.filesModified, details: fixResult.details, success: false });
 
             // Check if agent should be interrupted (repeated failures / looping)
             const interruptCheck = this.shouldInterrupt(repairAttempts);
@@ -296,7 +298,17 @@ class AutonomousBuilder extends EventEmitter {
             const fixResult = await applyFix(analysis, { projectDir, plan, buildContract });
             if (fixResult.applied) {
               emit({ type: 'fix.completed', strategy: fixResult.strategy, filesModified: fixResult.filesModified, details: fixResult.details, iteration });
-              repairAttempts.push({ strategy: fixResult.strategy, filesModified: fixResult.filesModified, details: fixResult.details, success: false });
+              repairAttempts.push({ strategy: fixResult.strategy, repairStrategy: fixResult.strategy, filesModified: fixResult.filesModified, details: fixResult.details, success: false });
+
+              // HARDENING: Check if agent should be interrupted (repeated failures / looping)
+              const interruptCheck = this.shouldInterrupt(repairAttempts);
+              if (interruptCheck.shouldInterrupt) {
+                this.interruptAgent(taskId, interruptCheck.reason);
+                emit({ type: 'agent.interrupted', reason: interruptCheck.reason });
+                taskStore.fail(taskId, `Agent interrupted: ${interruptCheck.reason}`, 'TEST');
+                await this.storeKnowledge(plan, taskStore.getTask(taskId), emit);
+                return taskStore.getTask(taskId);
+              }
             } else if (fixResult.shouldEscalate) {
               emit({ type: 'fix.escalated', reason: fixResult.details });
               taskStore.fail(taskId, `Tests failed: ${fixResult.details}`, 'TEST');
@@ -388,6 +400,175 @@ class AutonomousBuilder extends EventEmitter {
         emit({ type: `browser.test.${browserResult.status.toLowerCase()}`, status: browserResult.status, errors: browserResult.errors?.length || 0, checks: browserResult.checks?.length || 0 });
         if (browserResult.screenshots?.length > 0) {
           emit({ type: 'browser.screenshot', path: browserResult.screenshots[0] });
+        }
+
+        // HARDENING: Playwright is a hard completion gate for web applications.
+        // If browser inspection is BLOCKED (no Playwright) or FAIL (errors detected),
+        // the task CANNOT reach COMPLETED until repaired or explicitly escalated.
+        if (browserResult.status === 'BLOCKED') {
+          // Playwright not available — verification is BLOCKED
+          const blockedMsg = browserResult.errors[0]?.message || 'Playwright not available — browser verification blocked';
+          taskStore.fail(taskId, `VERIFICATION BLOCKED: ${blockedMsg}`, 'BROWSER');
+          emit({ type: 'task.failed', error: blockedMsg, verified: false, finalInspection: 'BLOCKED' });
+          // Kill preview server before returning
+          if (previewServer) {
+            try { previewServer.kill('SIGTERM'); } catch {}
+            try { previewServer.kill('SIGKILL'); } catch {}
+          }
+          await this.storeKnowledge(plan, taskStore.getTask(taskId), emit);
+          return taskStore.getTask(taskId);
+        }
+
+        if (browserResult.status === 'FAIL') {
+          // Browser test failed — analyze the error and attempt repair before giving up
+          taskStore.setPhase(taskId, 'error-analysis');
+          emit({ type: 'error.detected', phase: 'browser', iteration: 'final' });
+          emit({ type: 'analysis.started', phase: 'browser' });
+          const browserAnalysis = await analyzeError({
+            error: browserResult.errors.map(e => e.message).join('\n'),
+            browserEvidence: browserResult.evidence,
+            taskDefinition: decomposedTasks.find(t => t.agent_type === 'browser'),
+            buildContract,
+            previousRepairAttempts: repairAttempts,
+          });
+          taskStore.update(taskId, { errorAnalysis: browserAnalysis });
+          emit({ type: 'analysis.completed', whatFailed: browserAnalysis.whatFailed, rootCause: browserAnalysis.rootCause, repairStrategy: browserAnalysis.repairStrategy });
+
+          // Attempt fix
+          taskStore.setPhase(taskId, 'fixing-browser');
+          emit({ type: 'fix.started', strategy: browserAnalysis.repairStrategy, iteration: 'browser-final' });
+          const browserFixResult = await applyFix(browserAnalysis, { projectDir, plan, buildContract });
+          if (browserFixResult.applied) {
+            emit({ type: 'fix.completed', strategy: browserFixResult.strategy, filesModified: browserFixResult.filesModified, details: browserFixResult.details });
+
+            // HARDENING: Track browser repair attempts for repeated-failure detection
+            repairAttempts.push({ strategy: browserFixResult.strategy, repairStrategy: browserFixResult.strategy, filesModified: browserFixResult.filesModified, details: browserFixResult.details, success: false, phase: 'browser' });
+
+            // Check if agent should be interrupted (repeated failures / looping)
+            const interruptCheck = this.shouldInterrupt(repairAttempts, 'browser');
+            if (interruptCheck.shouldInterrupt) {
+              this.interruptAgent(taskId, interruptCheck.reason);
+              emit({ type: 'agent.interrupted', reason: interruptCheck.reason });
+              taskStore.fail(taskId, `Agent interrupted: ${interruptCheck.reason}`, 'BROWSER');
+              if (previewServer) { try { previewServer.kill('SIGTERM'); } catch {} try { previewServer.kill('SIGKILL'); } catch {} }
+              await this.storeKnowledge(plan, taskStore.getTask(taskId), emit);
+              return taskStore.getTask(taskId);
+            }
+
+            // HARDENING: Full post-repair verification chain: BUILD → TEST → RUNTIME → PLAYWRIGHT → REGRESSION
+            // Step 1: BUILD (rebuild after fix)
+            emit({ type: 'rebuild.started', reason: 'browser fix verification' });
+            const rebuildResult = await this.executeWithResilience(taskId, {
+              command: plan.buildCommand, cwd: projectDir,
+              onOutput: (o) => emit({ type: 'command.output', stream: o.stream, data: o.data }),
+            }, emit);
+            if (rebuildResult.exitCode !== 0) {
+              emit({ type: 'build.failed', exitCode: rebuildResult.exitCode });
+              const failMsg = `Rebuild failed after browser fix: ${(rebuildResult.stderr || rebuildResult.stdout).slice(0, 200)}`;
+              taskStore.fail(taskId, `VERIFICATION BLOCKED: ${failMsg}`, 'BROWSER');
+              emit({ type: 'task.failed', error: failMsg, verified: false });
+              if (previewServer) { try { previewServer.kill('SIGTERM'); } catch {} try { previewServer.kill('SIGKILL'); } catch {} }
+              await this.storeKnowledge(plan, taskStore.getTask(taskId), emit);
+              return taskStore.getTask(taskId);
+            }
+            emit({ type: 'build.completed', exitCode: 0 });
+
+            // Step 2: TEST (re-run test suite after fix)
+            if (plan.testCommand) {
+              emit({ type: 'test.started', command: plan.testCommand, cwd: projectDir, reason: 'post-repair verification' });
+              const postFixTestResult = await this.executeWithResilience(taskId, {
+                command: plan.testCommand, cwd: projectDir,
+                onOutput: (o) => emit({ type: 'command.output', stream: o.stream, data: o.data }),
+              }, emit);
+              emit({ type: testResult?.exitCode === 0 ? 'test.passed' : 'test.failed', exitCode: postFixTestResult.exitCode });
+              if (postFixTestResult.exitCode !== 0) {
+                const failMsg = `Tests failed after browser fix: ${(postFixTestResult.stderr || postFixTestResult.stdout).slice(0, 200)}`;
+                taskStore.fail(taskId, `VERIFICATION BLOCKED: ${failMsg}`, 'TEST');
+                emit({ type: 'task.failed', error: failMsg, verified: false });
+                if (previewServer) { try { previewServer.kill('SIGTERM'); } catch {} try { previewServer.kill('SIGKILL'); } catch {} }
+                await this.storeKnowledge(plan, taskStore.getTask(taskId), emit);
+                return taskStore.getTask(taskId);
+              }
+            }
+
+            // Step 3: RUNTIME inspection (preview server still running)
+            emit({ type: 'runtime.inspection.started', reason: 'post-repair verification' });
+            let postFixRuntimeResult = null;
+            try {
+              postFixRuntimeResult = await inspectRuntime({ projectDir, port: 4173 });
+            } catch (err) {
+              postFixRuntimeResult = { status: 'FAIL', errors: [{ message: err.message }], checks: [], warnings: [], evidence: [] };
+            }
+            emit({ type: `runtime.inspection.${postFixRuntimeResult.status.toLowerCase()}`, status: postFixRuntimeResult.status, errors: postFixRuntimeResult.errors?.length || 0 });
+            if (postFixRuntimeResult.status !== 'PASS') {
+              const failMsg = `Runtime inspection failed after browser fix: ${postFixRuntimeResult.errors.map(e => e.message).join('; ')}`;
+              taskStore.fail(taskId, `VERIFICATION BLOCKED: ${failMsg}`, 'RUNTIME');
+              emit({ type: 'task.failed', error: failMsg, verified: false });
+              if (previewServer) { try { previewServer.kill('SIGTERM'); } catch {} try { previewServer.kill('SIGKILL'); } catch {} }
+              await this.storeKnowledge(plan, taskStore.getTask(taskId), emit);
+              return taskStore.getTask(taskId);
+            }
+
+            // Step 4: PLAYWRIGHT (re-run browser inspection)
+            emit({ type: 'browser.test.recheck' });
+            const recheckResult = await inspectBrowser({ url: 'http://localhost:4173', projectDir, screenshots: false, timeout: 15000 });
+            emit({ type: `browser.test.${recheckResult.status.toLowerCase()}`, status: recheckResult.status, errors: recheckResult.errors?.length || 0, recheck: true });
+            if (recheckResult.status !== 'PASS') {
+              // Still failing — cannot complete
+              const failMsg = `Browser inspection failed after repair: ${recheckResult.errors.map(e => e.message).join('; ')}`;
+              taskStore.fail(taskId, `VERIFICATION BLOCKED: ${failMsg}`, 'BROWSER');
+              emit({ type: 'task.failed', error: failMsg, verified: false, finalInspection: 'BLOCKED' });
+              if (previewServer) { try { previewServer.kill('SIGTERM'); } catch {} try { previewServer.kill('SIGKILL'); } catch {} }
+              await this.storeKnowledge(plan, taskStore.getTask(taskId), emit);
+              return taskStore.getTask(taskId);
+            }
+            browserResult = recheckResult;
+            taskStore.update(taskId, { browserResult });
+            taskStore.update(taskId, { runtimeResult: postFixRuntimeResult });
+
+            // Step 5: REGRESSION (verify fix didn't break existing functionality)
+            taskStore.setPhase(taskId, 'regression-testing');
+            emit({ type: 'regression.started', reason: 'verifying browser fix did not break existing functionality' });
+            const regBuildResult = await this.executeWithResilience(taskId, {
+              command: plan.buildCommand, cwd: projectDir,
+              onOutput: (o) => emit({ type: 'command.output', stream: o.stream, data: o.data }),
+            }, emit);
+            if (regBuildResult.exitCode !== 0) {
+              emit({ type: 'regression.failed', reason: 'build broken after browser fix' });
+              const failMsg = `Regression: build broken after browser fix`;
+              taskStore.fail(taskId, `VERIFICATION BLOCKED: ${failMsg}`, 'REGRESSION');
+              emit({ type: 'task.failed', error: failMsg, verified: false });
+              if (previewServer) { try { previewServer.kill('SIGTERM'); } catch {} try { previewServer.kill('SIGKILL'); } catch {} }
+              await this.storeKnowledge(plan, taskStore.getTask(taskId), emit);
+              return taskStore.getTask(taskId);
+            }
+            if (plan.testCommand) {
+              const regTestResult = await this.executeWithResilience(taskId, {
+                command: plan.testCommand, cwd: projectDir,
+                onOutput: (o) => emit({ type: 'command.output', stream: o.stream, data: o.data }),
+              }, emit);
+              if (regTestResult.exitCode !== 0) {
+                emit({ type: 'regression.failed', reason: 'tests broken after browser fix' });
+                const failMsg = `Regression: tests broken after browser fix`;
+                taskStore.fail(taskId, `VERIFICATION BLOCKED: ${failMsg}`, 'REGRESSION');
+                emit({ type: 'task.failed', error: failMsg, verified: false });
+                if (previewServer) { try { previewServer.kill('SIGTERM'); } catch {} try { previewServer.kill('SIGKILL'); } catch {} }
+                await this.storeKnowledge(plan, taskStore.getTask(taskId), emit);
+                return taskStore.getTask(taskId);
+              }
+            }
+            emit({ type: 'regression.passed', message: 'No regressions detected after browser fix' });
+          } else {
+            // Could not fix browser issue — cannot complete
+            const failMsg = browserFixResult.shouldEscalate
+              ? `Browser inspection failed and repair escalated: ${browserFixResult.details}`
+              : `Browser inspection failed: ${browserResult.errors.map(e => e.message).join('; ')}`;
+            taskStore.fail(taskId, `VERIFICATION BLOCKED: ${failMsg}`, 'BROWSER');
+            emit({ type: 'task.failed', error: failMsg, verified: false, finalInspection: 'BLOCKED' });
+            if (previewServer) { try { previewServer.kill('SIGTERM'); } catch {} try { previewServer.kill('SIGKILL'); } catch {} }
+            await this.storeKnowledge(plan, taskStore.getTask(taskId), emit);
+            return taskStore.getTask(taskId);
+          }
         }
 
         // 9b. RUNTIME INSPECTION — verify the server process is healthy

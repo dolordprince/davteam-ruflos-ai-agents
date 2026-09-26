@@ -1,9 +1,16 @@
 // backend/src/error-analyzer.js — Error Analysis stage.
 // When an error occurs, does NOT immediately let an agent start editing files.
 // First collects evidence, determines root cause, and selects a repair strategy.
+//
+// HARDENING: Two-layer analysis:
+//   Layer 1: Deterministic rule-based analyzer (always runs first)
+//   Layer 2: Model-assisted analysis (when deterministic analyzer cannot confidently
+//            establish root cause, invokes configured Ruflo/model intelligence)
 import { logger } from './logger.js';
 import { runRufloJson } from './ruflo-runtime.js';
 import { readFile, listFiles, fileExists } from './file-ops.js';
+import { chatCompletion, ProviderError } from './provider.js';
+import { config } from './config.js';
 
 /**
  * Analyze an error and determine the root cause and repair strategy.
@@ -79,6 +86,62 @@ export async function analyzeError(errorContext = {}) {
   analysis.expectedBehavior = determineExpectedBehavior(taskDefinition, buildContract, analysis.whatFailed);
   analysis.failedBehavior = error.slice(0, 200);
 
+  // Step 7: HARDENING — Model-assisted analysis when deterministic analyzer is not confident
+  // If the deterministic root cause is vague or the failure type is UNKNOWN_FAILURE,
+  // invoke the configured model intelligence for a deeper analysis.
+  const isConfident = analysis.whatFailed !== 'UNKNOWN_FAILURE' &&
+                      analysis.rootCause &&
+                      !analysis.rootCause.startsWith('Unknown') &&
+                      analysis.repairStrategy !== 'FIX_SOURCE'; // FIX_SOURCE is the generic fallback
+
+  if (!isConfident && config.modelApiKey) {
+    analysis.analysisMethod = 'model-assisted';
+    analysis.evidence.push({ source: 'analysis-method', value: 'Deterministic analysis not confident — invoking model-assisted analysis' });
+    try {
+      const modelAnalysis = await modelAssistedAnalysis({
+        error,
+        stackTrace,
+        failingCommand,
+        failingTest,
+        browserEvidence,
+        runtimeLogs,
+        taskDefinition,
+        buildContract,
+        previousRepairAttempts,
+        deterministicAnalysis: analysis,
+        memoryResults,
+      });
+      if (modelAnalysis) {
+        // Merge model analysis into our result — model takes priority for root cause
+        analysis.whatFailed = modelAnalysis.failure_type || analysis.whatFailed;
+        analysis.rootCause = modelAnalysis.root_cause || analysis.rootCause;
+        analysis.repairStrategy = modelAnalysis.repair_strategy || analysis.repairStrategy;
+        if (modelAnalysis.relevant_files?.length > 0) {
+          analysis.relevantFiles = modelAnalysis.relevant_files;
+        }
+        analysis.confidence = modelAnalysis.confidence || 0;
+        analysis.verificationPlan = modelAnalysis.verification_plan || [];
+        analysis.evidence.push({ source: 'model-analysis', value: `confidence: ${analysis.confidence}, strategy: ${analysis.repairStrategy}` });
+        logger.info('error-analyzer.model-assisted', {
+          confidence: analysis.confidence,
+          rootCause: analysis.rootCause,
+          strategy: analysis.repairStrategy,
+        });
+      }
+    } catch (err) {
+      if (err instanceof ProviderError) {
+        analysis.evidence.push({ source: 'model-analysis', value: `Model analysis failed: ${err.code} — falling back to deterministic` });
+        logger.warn('error-analyzer.model.failed', { code: err.code, error: err.message });
+      } else {
+        analysis.evidence.push({ source: 'model-analysis', value: `Model analysis error: ${err.message}` });
+        logger.warn('error-analyzer.model.error', { error: err.message });
+      }
+    }
+  } else {
+    analysis.analysisMethod = 'deterministic';
+    analysis.confidence = isConfident ? 0.8 : 0.3;
+  }
+
   logger.info('error-analyzer.complete', {
     whatFailed: analysis.whatFailed,
     rootCause: analysis.rootCause,
@@ -88,6 +151,159 @@ export async function analyzeError(errorContext = {}) {
   });
 
   return analysis;
+}
+
+/**
+ * HARDENING: Model-assisted error analysis.
+ * When the deterministic analyzer cannot confidently establish root cause,
+ * invoke the configured Ruflo/model intelligence with full context.
+ *
+ * Provides the model with:
+ * - Build Contract
+ * - current task
+ * - exact error
+ * - stack trace
+ * - command output
+ * - relevant files
+ * - recent changes
+ * - browser evidence
+ * - runtime evidence
+ * - previous repair attempts
+ * - Ruflo memory results
+ *
+ * Returns structured analysis. Does NOT expose private chain-of-thought.
+ * Stores concise conclusions and evidence only.
+ */
+async function modelAssistedAnalysis(context = {}) {
+  const {
+    error = '',
+    stackTrace = '',
+    failingCommand = '',
+    failingTest = '',
+    browserEvidence = null,
+    runtimeLogs = '',
+    taskDefinition = null,
+    buildContract = null,
+    previousRepairAttempts = [],
+    deterministicAnalysis = {},
+    memoryResults = [],
+  } = context;
+
+  // Build the prompt with full context
+  const systemPrompt = `You are an expert software error analyst. Analyze the error and return structured JSON only.
+Do not include chain-of-thought, explanations, or commentary — only the JSON result.
+
+Return exactly this JSON structure:
+{
+  "failure_type": "BUILD_FAILURE|TEST_FAILURE|SYNTAX_ERROR|MISSING_DEPENDENCY|TYPE_ERROR|IMPORT_ERROR|BROWSER_FAILURE|NETWORK_FAILURE|UNKNOWN_FAILURE",
+  "root_cause": "concise description of the actual root cause",
+  "confidence": 0.0 to 1.0,
+  "relevant_files": ["list of file paths that need modification"],
+  "evidence": ["concise evidence items supporting the conclusion"],
+  "repair_strategy": "ADD_DEPENDENCY|FIX_SYNTAX|FIX_IMPORT|FIX_TYPE|FIX_SOURCE|FIX_TEST|FIX_BROWSER|REGENERATE_FILE|SIMPLIFY_CODE|ESCALATE_TO_USER",
+  "verification_plan": ["steps to verify the fix works"]
+}`;
+
+  // Assemble the user message with all available context
+  const contextParts = [];
+
+  if (buildContract) {
+    contextParts.push(`BUILD CONTRACT:\n${JSON.stringify({
+      goal: buildContract.goal,
+      requirements: buildContract.requirements,
+      acceptance_criteria: buildContract.acceptance_criteria,
+      frontend: buildContract.frontend,
+      backend: buildContract.backend,
+    }, null, 2)}`);
+  }
+
+  if (taskDefinition) {
+    contextParts.push(`CURRENT TASK:\n${JSON.stringify({
+      task_id: taskDefinition.task_id,
+      description: taskDefinition.description,
+      agent_type: taskDefinition.agent_type,
+      acceptance_criteria: taskDefinition.acceptance_criteria,
+    }, null, 2)}`);
+  }
+
+  contextParts.push(`EXACT ERROR:\n${error.slice(0, 2000)}`);
+
+  if (stackTrace) {
+    contextParts.push(`STACK TRACE:\n${stackTrace.slice(0, 1000)}`);
+  }
+
+  if (failingCommand) {
+    contextParts.push(`FAILING COMMAND:\n${failingCommand}`);
+  }
+
+  if (failingTest) {
+    contextParts.push(`FAILING TEST:\n${failingTest}`);
+  }
+
+  if (browserEvidence) {
+    contextParts.push(`BROWSER EVIDENCE:\n${JSON.stringify(browserEvidence).slice(0, 500)}`);
+  }
+
+  if (runtimeLogs) {
+    contextParts.push(`RUNTIME LOGS:\n${runtimeLogs.slice(0, 500)}`);
+  }
+
+  if (deterministicAnalysis.relevantFiles?.length > 0) {
+    contextParts.push(`RELEVANT FILES (from deterministic analysis):\n${deterministicAnalysis.relevantFiles.join(', ')}`);
+  }
+
+  if (previousRepairAttempts.length > 0) {
+    contextParts.push(`PREVIOUS REPAIR ATTEMPTS:\n${JSON.stringify(previousRepairAttempts.map(a => ({
+      strategy: a.strategy || a.repairStrategy,
+      filesModified: a.filesModified,
+      details: a.details,
+      success: a.success,
+    })), null, 2)}`);
+  }
+
+  if (memoryResults.length > 0) {
+    contextParts.push(`RUFLO MEMORY RESULTS:\n${JSON.stringify(memoryResults.slice(0, 3)).slice(0, 500)}`);
+  }
+
+  contextParts.push(`DETERMINISTIC ANALYSIS (initial):\n${JSON.stringify({
+    whatFailed: deterministicAnalysis.whatFailed,
+    rootCause: deterministicAnalysis.rootCause,
+    repairStrategy: deterministicAnalysis.repairStrategy,
+  })}`);
+
+  const userMessage = contextParts.join('\n\n---\n\n');
+
+  const result = await chatCompletion({
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userMessage },
+    ],
+  });
+
+  // Parse the JSON response — extract only conclusions, not chain-of-thought
+  const content = result.content || '';
+  const jsonMatch = content.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) {
+    logger.warn('error-analyzer.model.no-json', { content: content.slice(0, 200) });
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(jsonMatch[0]);
+    // Validate the structure
+    return {
+      failure_type: parsed.failure_type || 'UNKNOWN_FAILURE',
+      root_cause: String(parsed.root_cause || '').slice(0, 500),
+      confidence: Math.min(1, Math.max(0, parseFloat(parsed.confidence) || 0)),
+      relevant_files: Array.isArray(parsed.relevant_files) ? parsed.relevant_files.slice(0, 10) : [],
+      evidence: Array.isArray(parsed.evidence) ? parsed.evidence.slice(0, 5) : [],
+      repair_strategy: parsed.repair_strategy || 'FIX_SOURCE',
+      verification_plan: Array.isArray(parsed.verification_plan) ? parsed.verification_plan.slice(0, 5) : [],
+    };
+  } catch (err) {
+    logger.warn('error-analyzer.model.parse.failed', { error: err.message, content: content.slice(0, 200) });
+    return null;
+  }
 }
 
 function determineWhatFailed(error, failingCommand, failingTest, browserEvidence) {

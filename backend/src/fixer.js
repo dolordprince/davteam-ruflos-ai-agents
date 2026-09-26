@@ -3,10 +3,17 @@
 // The Fixer receives ROOT CAUSE, EVIDENCE, RELEVANT FILES, REPAIR STRATEGY,
 // and applies the SMALLEST appropriate correction.
 // After modification: REBUILD → TEST → INSPECT → VERIFY
+//
+// HARDENING: Two-layer repair:
+//   Layer 1: Deterministic fixer for simple known failures (always tries first)
+//   Layer 2: Model-assisted repair for complex failures (when deterministic fixer
+//            cannot handle the issue, hands the analyzed failure to the model agent)
 import { logger } from './logger.js';
-import { readFile, writeFile, fileExists } from './file-ops.js';
+import { readFile, writeFile, fileExists, listFiles } from './file-ops.js';
 import { executeCommand } from './command-exec.js';
 import { join } from 'node:path';
+import { chatCompletion, ProviderError } from './provider.js';
+import { config } from './config.js';
 
 /**
  * Apply the smallest appropriate correction based on error analysis.
@@ -91,8 +98,176 @@ export async function applyFix(analysis, context = {}) {
   }
 
   result.success = result.applied && !result.shouldEscalate;
+
+  // HARDENING: If the deterministic fixer could not handle the issue, try model-assisted repair
+  if (!result.applied && !result.shouldEscalate && config.modelApiKey) {
+    logger.info('fixer.model-assisted.fallback', { strategy: analysis.repairStrategy });
+    result.analysisMethod = 'model-assisted';
+    try {
+      const modelFix = await modelAssistedRepair(analysis, context);
+      if (modelFix && modelFix.applied) {
+        result.applied = true;
+        result.strategy = `MODEL_${analysis.repairStrategy}`;
+        result.filesModified = modelFix.filesModified;
+        result.details = modelFix.details;
+        result.success = true;
+        result.evidence = modelFix.evidence || [];
+        logger.info('fixer.model-assisted.success', { files: result.filesModified });
+      } else if (modelFix && modelFix.shouldEscalate) {
+        result.shouldEscalate = true;
+        result.details = modelFix.details || 'Model-assisted repair escalated';
+      }
+    } catch (err) {
+      if (err instanceof ProviderError) {
+        result.details = `Model-assisted repair failed: ${err.code}`;
+        logger.warn('fixer.model-assisted.provider.error', { code: err.code });
+      } else {
+        result.details = `Model-assisted repair error: ${err.message}`;
+        logger.warn('fixer.model-assisted.error', { error: err.message });
+      }
+    }
+  } else {
+    result.analysisMethod = 'deterministic';
+  }
   logger.info('fixer.complete', { applied: result.applied, success: result.success, files: result.filesModified });
   return result;
+}
+
+/**
+ * HARDENING: Model-assisted repair for complex failures.
+ * When the deterministic fixer cannot handle the issue, hand the analyzed failure
+ * to the configured model agent. The repair agent receives:
+ * - root cause
+ * - evidence
+ * - relevant files
+ * - expected behavior
+ * - failed behavior
+ * - repair strategy
+ * - acceptance criteria
+ *
+ * It must modify the actual workspace. After modification:
+ * BUILD → TEST → RUNTIME → PLAYWRIGHT → REGRESSION
+ *
+ * Does NOT expose private chain-of-thought. Stores concise conclusions only.
+ */
+async function modelAssistedRepair(analysis, context = {}) {
+  const { projectDir = '.', plan = null, buildContract = null } = context;
+  const result = {
+    applied: false,
+    filesModified: [],
+    details: '',
+    shouldEscalate: false,
+    evidence: [],
+  };
+
+  // Gather file contents for relevant files
+  const fileContents = {};
+  for (const relFile of analysis.relevantFiles.slice(0, 5)) {
+    try {
+      const filePath = join(projectDir, relFile);
+      if (fileExists(filePath)) {
+        fileContents[relFile] = readFile(filePath).slice(0, 3000);
+      }
+    } catch {}
+  }
+
+  const systemPrompt = `You are an expert software repair agent. You fix code based on error analysis.
+You must modify the actual workspace files. Return ONLY structured JSON — no explanations or chain-of-thought.
+
+Return exactly this JSON structure:
+{
+  "applied": true/false,
+  "files_modified": [{"path": "relative/path", "content": "full corrected file content"}],
+  "details": "concise description of what was changed and why",
+  "should_escalate": false,
+  "evidence": ["concise evidence items"]
+}
+
+Rules:
+- Make the SMALLEST appropriate correction
+- Include the FULL corrected file content, not just the diff
+- Do not modify unrelated files
+- If you cannot fix the issue, set applied=false and should_escalate=true`;
+
+  const contextParts = [];
+  contextParts.push(`ROOT CAUSE:\n${analysis.rootCause}`);
+  contextParts.push(`REPAIR STRATEGY:\n${analysis.repairStrategy}`);
+  contextParts.push(`WHAT FAILED:\n${analysis.whatFailed}`);
+  contextParts.push(`FAILED BEHAVIOR:\n${analysis.failedBehavior}`);
+  contextParts.push(`EXPECTED BEHAVIOR:\n${analysis.expectedBehavior}`);
+
+  if (analysis.evidence?.length > 0) {
+    contextParts.push(`EVIDENCE:\n${JSON.stringify(analysis.evidence.slice(0, 5))}`);
+  }
+
+  if (Object.keys(fileContents).length > 0) {
+    contextParts.push(`RELEVANT FILES:\n${JSON.stringify(fileContents)}`);
+  }
+
+  if (buildContract?.acceptance_criteria?.length > 0) {
+    contextParts.push(`ACCEPTANCE CRITERIA:\n${buildContract.acceptance_criteria.join('; ')}`);
+  }
+
+  if (analysis.previousAttempts > 0) {
+    contextParts.push(`PREVIOUS REPAIR ATTEMPTS: ${analysis.previousAttempts}`);
+  }
+
+  const userMessage = contextParts.join('\n\n---\n\n');
+
+  try {
+    const modelResult = await chatCompletion({
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userMessage },
+      ],
+    });
+
+    const content = modelResult.content || '';
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      result.details = 'Model repair returned no valid JSON';
+      logger.warn('fixer.model.no-json', { content: content.slice(0, 200) });
+      return result;
+    }
+
+    const parsed = JSON.parse(jsonMatch[0]);
+
+    if (parsed.should_escalate) {
+      result.shouldEscalate = true;
+      result.details = parsed.details || 'Model repair escalated';
+      return result;
+    }
+
+    // Apply the file modifications to the actual workspace
+    if (parsed.files_modified && Array.isArray(parsed.files_modified)) {
+      for (const fileMod of parsed.files_modified) {
+        if (fileMod.path && fileMod.content !== undefined) {
+          try {
+            const filePath = join(projectDir, fileMod.path);
+            writeFile(filePath, fileMod.content);
+            result.filesModified.push(fileMod.path);
+            result.evidence.push(`Modified ${fileMod.path}`);
+          } catch (err) {
+            result.evidence.push(`Failed to write ${fileMod.path}: ${err.message}`);
+          }
+        }
+      }
+    }
+
+    result.applied = result.filesModified.length > 0;
+    result.details = parsed.details || `Model-assisted repair: ${result.filesModified.length} files modified`;
+
+    logger.info('fixer.model.applied', { files: result.filesModified, details: result.details });
+    return result;
+  } catch (err) {
+    if (err instanceof ProviderError) {
+      result.details = `Model repair provider error: ${err.code}`;
+    } else {
+      result.details = `Model repair error: ${err.message}`;
+    }
+    logger.warn('fixer.model.error', { error: err.message });
+    return result;
+  }
 }
 
 /**

@@ -77,12 +77,20 @@ export async function finalInspect(buildContract, taskState, options = {}) {
   result.evidence.push({ check: 'tests', evidence: testCheck.evidence });
   if (testCheck.status === 'FAIL') result.gaps.push(testCheck.detail);
 
-  // --- Criterion 7: Browser inspection (if applicable) ---
-  if (buildContract.frontend?.required && port) {
-    const browserCheck = await checkBrowser(port, projectDir);
+  // --- Criterion 7: Browser inspection (HARDENING: required for web apps) ---
+  // For web applications, Playwright browser verification is a hard gate.
+  // BLOCKED (no Playwright) or FAIL (errors) both prevent COMPLETED.
+  const isWebApp = buildContract.frontend?.type || buildContract.frontend?.framework || fileExists(join(projectDir, 'index.html'));
+  if (isWebApp) {
+    const browserCheck = await checkBrowser(port || 4173, projectDir);
     result.criteria.push(browserCheck);
     result.evidence.push({ check: 'browser', evidence: browserCheck.evidence });
-    if (browserCheck.status === 'FAIL') result.gaps.push(browserCheck.detail);
+    // HARDENING: BLOCKED and FAIL both create gaps — no silent pass
+    if (browserCheck.status === 'BLOCKED') {
+      result.gaps.push(`Browser verification BLOCKED: ${browserCheck.detail}`);
+    } else if (browserCheck.status === 'FAIL') {
+      result.gaps.push(browserCheck.detail);
+    }
   }
 
   // --- Criterion 8: Runtime inspection (if server is running) ---
@@ -211,14 +219,17 @@ async function checkTests(projectDir) {
 async function checkBrowser(port, projectDir) {
   try {
     const brResult = await inspectBrowser({ url: `http://localhost:${port}`, projectDir, screenshots: false });
+    // HARDENING: BLOCKED (no Playwright) and FAIL both prevent COMPLETED
     return {
       name: 'browser-inspection',
-      status: brResult.status === 'PASS' ? 'PASS' : brResult.status === 'SKIP' ? 'SKIP' : 'FAIL',
-      detail: `${brResult.checks.length} browser checks, ${brResult.errors.length} errors`,
+      status: brResult.status === 'PASS' ? 'PASS' : brResult.status === 'BLOCKED' ? 'BLOCKED' : 'FAIL',
+      detail: brResult.status === 'BLOCKED'
+        ? `Browser verification BLOCKED: ${brResult.errors[0]?.message || 'Playwright not available'}`
+        : `${brResult.checks.length} browser checks, ${brResult.errors.length} errors`,
       evidence: brResult.evidence.map(e => e.evidence).join('; '),
     };
   } catch (err) {
-    return { name: 'browser-inspection', status: 'SKIP', detail: err.message, evidence: err.message };
+    return { name: 'browser-inspection', status: 'BLOCKED', detail: `Browser inspection failed: ${err.message}`, evidence: err.message };
   }
 }
 
