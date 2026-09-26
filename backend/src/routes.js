@@ -16,6 +16,8 @@ import {
   listPlugins, getPlugin, jevPluginInfo, jevTools, executeJevTool, jevConfigured, JevError,
 } from './jev-plugin.js';
 import { autonomousBuilder } from './autonomous-builder.js';
+import { taskStore } from './task-store.js';
+import { getTaskStatusSummary, handleFailure, resumeFromCheckpoint } from './resilience.js';
 
 const router = Router();
 
@@ -529,6 +531,10 @@ router.post('/api/autonomous/build/sync', async (req, res) => {
       signal: null,
       maxFixIterations: 3,
     });
+    // Include events from the durable event log
+    if (task && task.taskId) {
+      task.events = taskStore.getEvents(task.taskId);
+    }
     res.json(task);
   } catch (err) {
     apiError(res, 'AUTONOMOUS_BUILD_FAILED', err.message, 500);
@@ -552,6 +558,229 @@ router.post('/api/autonomous/plan', (req, res) => {
   } catch (err) {
     apiError(res, 'PLAN_FAILED', err.message, 500);
   }
+});
+
+// --- Durable task management (interactive during build) ---
+
+// GET /api/tasks — list all tasks
+router.get('/api/tasks', (req, res) => {
+  res.json({ tasks: taskStore.listTasks() });
+});
+
+// GET /api/tasks/active — list active (non-terminal) tasks
+router.get('/api/tasks/active', (req, res) => {
+  res.json({ tasks: taskStore.listActiveTasks() });
+});
+
+// GET /api/tasks/:taskId — get task state
+router.get('/api/tasks/:taskId', (req, res) => {
+  const task = taskStore.getTask(req.params.taskId);
+  if (!task) return apiError(res, 'NOT_FOUND', 'Task not found', 404);
+  res.json(task);
+});
+
+// GET /api/tasks/:taskId/status — get human-readable status summary (for "what are you doing?")
+router.get('/api/tasks/:taskId/status', (req, res) => {
+  const summary = getTaskStatusSummary(req.params.taskId);
+  if (!summary) return apiError(res, 'NOT_FOUND', 'Task not found', 404);
+  res.json(summary);
+});
+
+// GET /api/tasks/:taskId/events — get events (with optional afterEventId for reconnection)
+router.get('/api/tasks/:taskId/events', (req, res) => {
+  const { after } = req.query;
+  const events = taskStore.getEvents(req.params.taskId, after || null);
+  if (events === null || events === undefined) {
+    const task = taskStore.getTask(req.params.taskId);
+    if (!task) return apiError(res, 'NOT_FOUND', 'Task not found', 404);
+  }
+  res.json({ taskId: req.params.taskId, events, count: events.length });
+});
+
+// GET /api/tasks/:taskId/stream — SSE stream with reconnection support
+// Uses Last-Event-ID header to recover missed events on reconnect
+router.get('/api/tasks/:taskId/stream', (req, res) => {
+  const taskId = req.params.taskId;
+  const task = taskStore.getTask(taskId);
+  if (!task) return apiError(res, 'NOT_FOUND', 'Task not found', 404);
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+
+  // Recover missed events using Last-Event-ID header (SSE standard)
+  const lastEventId = req.headers['last-event-id'] || req.query.after || null;
+
+  // Send current task state first
+  const snapshot = taskStore.getTaskSnapshot(taskId);
+  res.write(`data: ${JSON.stringify({ type: 'task.state', taskId, status: task.status, phase: task.phase, ...snapshot })}\n\n`);
+
+  // Replay missed events
+  if (lastEventId) {
+    const missed = taskStore.getEvents(taskId, lastEventId);
+    for (const evt of missed) {
+      res.write(`id: ${evt.id}\n`);
+      res.write(`data: ${JSON.stringify(evt)}\n\n`);
+    }
+  } else {
+    // No Last-Event-ID — send all events
+    const allEvents = taskStore.getEvents(taskId);
+    for (const evt of allEvents) {
+      res.write(`id: ${evt.id}\n`);
+      res.write(`data: ${JSON.stringify(evt)}\n\n`);
+    }
+  }
+
+  // If task is terminal, close the stream
+  if (['COMPLETED', 'CANCELLED', 'FAILED'].includes(task.status)) {
+    res.write(`event: close\ndata: ${JSON.stringify({ type: 'stream.closed', status: task.status })}\n\n`);
+    res.end();
+    return;
+  }
+
+  // Subscribe to live events
+  const unsubscribe = taskStore.subscribe(taskId, (event) => {
+    res.write(`id: ${event.id}\n`);
+    res.write(`data: ${JSON.stringify(event)}\n\n`);
+
+    if (['task.completed', 'task.failed', 'task.cancelled'].includes(event.type)) {
+      res.write(`event: close\ndata: ${JSON.stringify({ type: 'stream.closed', status: event.type })}\n\n`);
+      res.end();
+    }
+  });
+
+  req.on('close', () => {
+    unsubscribe();
+  });
+});
+
+// POST /api/tasks/:taskId/pause — pause a running task
+router.post('/api/tasks/:taskId/pause', (req, res) => {
+  const task = taskStore.getTask(req.params.taskId);
+  if (!task) return apiError(res, 'NOT_FOUND', 'Task not found', 404);
+  if (['COMPLETED', 'CANCELLED', 'FAILED'].includes(task.status)) {
+    return apiError(res, 'INVALID_STATE', `Cannot pause task in ${task.status} state`, 400);
+  }
+  taskStore.checkpoint(req.params.taskId, { reason: 'user-pause' });
+  const paused = taskStore.pause(req.params.taskId);
+  res.json({ taskId: req.params.taskId, status: paused.status, message: 'Task paused. State checkpointed.' });
+});
+
+// POST /api/tasks/:taskId/resume — resume a paused task
+router.post('/api/tasks/:taskId/resume', async (req, res) => {
+  const task = taskStore.getTask(req.params.taskId);
+  if (!task) return apiError(res, 'NOT_FOUND', 'Task not found', 404);
+  if (task.status !== 'PAUSED') {
+    return apiError(res, 'INVALID_STATE', `Cannot resume task in ${task.status} state`, 400);
+  }
+  const resumed = taskStore.resume(req.params.taskId);
+  res.json({ taskId: req.params.taskId, status: resumed.status, message: 'Task resumed from checkpoint.' });
+
+  // Actually restart the build in the background (independent of browser)
+  if (task.goal) {
+    autonomousBuilder.build({
+      prompt: task.goal,
+      sessionId: task.sessionId,
+      onEvent: null,
+      taskId: req.params.taskId,
+      maxFixIterations: 3,
+    }).catch(err => logger.error('resume.build.failed', { taskId: req.params.taskId, error: err.message }));
+  }
+});
+
+// POST /api/tasks/:taskId/cancel — cancel a task
+router.post('/api/tasks/:taskId/cancel', (req, res) => {
+  const task = taskStore.getTask(req.params.taskId);
+  if (!task) return apiError(res, 'NOT_FOUND', 'Task not found', 404);
+  if (['COMPLETED', 'CANCELLED', 'FAILED'].includes(task.status)) {
+    return apiError(res, 'INVALID_STATE', `Task is already ${task.status}`, 400);
+  }
+  const cancelled = taskStore.cancel(req.params.taskId, req.body?.reason || 'user');
+  res.json({ taskId: req.params.taskId, status: cancelled.status, message: 'Task cancelled.' });
+});
+
+// POST /api/tasks/:taskId/retry — retry a failed/waiting task now
+router.post('/api/tasks/:taskId/retry', async (req, res) => {
+  const task = taskStore.getTask(req.params.taskId);
+  if (!task) return apiError(res, 'NOT_FOUND', 'Task not found', 404);
+  if (!['FAILED', 'WAITING_NETWORK', 'WAITING_PROVIDER', 'PAUSED'].includes(task.status)) {
+    return apiError(res, 'INVALID_STATE', `Cannot retry task in ${task.status} state`, 400);
+  }
+  taskStore.update(req.params.taskId, { retryCount: 0, lastError: null, networkState: 'online' });
+  taskStore.transition(req.params.taskId, 'RUNNING');
+  res.json({ taskId: req.params.taskId, status: 'RUNNING', message: 'Retrying task now.' });
+
+  // Restart the build in the background
+  autonomousBuilder.build({
+    prompt: task.goal,
+    sessionId: task.sessionId,
+    onEvent: null,
+    taskId: req.params.taskId,
+    maxFixIterations: 3,
+  }).catch(err => logger.error('retry.build.failed', { taskId: req.params.taskId, error: err.message }));
+});
+
+// POST /api/tasks/:taskId/conversation — conversation during build
+// User can ask "what are you doing?" and get a real state-based response
+router.post('/api/tasks/:taskId/conversation', (req, res) => {
+  const { message } = req.body || {};
+  const taskId = req.params.taskId;
+  const task = taskStore.getTask(taskId);
+  if (!task) return apiError(res, 'NOT_FOUND', 'Task not found', 404);
+
+  const msg = (message || '').toLowerCase();
+  let response = '';
+
+  if (/what are you doing|status|how far|progress|what's happening/.test(msg)) {
+    const summary = getTaskStatusSummary(taskId);
+    response = summary.summary;
+  } else if (/stop|cancel|abort/.test(msg)) {
+    taskStore.cancel(taskId, 'user-request');
+    response = 'I have stopped the current task. The task state has been saved.';
+  } else if (/pause|wait|hold/.test(msg)) {
+    taskStore.checkpoint(taskId, { reason: 'user-pause' });
+    taskStore.pause(taskId);
+    response = 'I have paused the current task. You can resume by saying "continue".';
+  } else if (/continue|resume|go on|keep going/.test(msg)) {
+    taskStore.resume(taskId);
+    response = 'I am resuming the task from where it was paused.';
+    // Restart in background
+    if (task.goal) {
+      autonomousBuilder.build({
+        prompt: task.goal, sessionId: task.sessionId, onEvent: null, taskId, maxFixIterations: 3,
+      }).catch(err => logger.error('conversation.resume.failed', { taskId, error: err.message }));
+    }
+  } else if (/change|modify|update|use|switch|different/.test(msg)) {
+    // User wants to modify the build — store as a note
+    taskStore.emitEvent(taskId, { type: 'user.modification', message });
+    response = `Understood. I'll incorporate "${message}" into the current build. The change will be applied when appropriate.`;
+  } else if (/error|fail|wrong|broken/.test(msg)) {
+    response = task.lastError
+      ? `The last error was: ${task.lastError}. Failure type: ${task.failureClassification || 'UNKNOWN'}. Retry count: ${task.retryCount}/${task.maxRetries}.`
+      : 'No errors have been recorded for this task.';
+  } else if (/file|what files|show files/.test(msg)) {
+    const files = task.filesCreated || [];
+    response = files.length > 0
+      ? `I have created ${files.length} files so far: ${files.slice(0, 10).join(', ')}${files.length > 10 ? '...' : ''}`
+      : 'No files have been created yet.';
+  } else if (/test/.test(msg)) {
+    response = task.testResult
+      ? `Tests ${task.testResult.exitCode === 0 ? 'passed' : 'failed'} (exit code ${task.testResult.exitCode}).`
+      : 'Tests have not been run yet.';
+  } else if (/build/.test(msg)) {
+    response = task.buildResult
+      ? `Build ${task.buildResult.exitCode === 0 ? 'succeeded' : 'failed'} (exit code ${task.buildResult.exitCode}).`
+      : 'Build has not been run yet.';
+  } else {
+    const summary = getTaskStatusSummary(taskId);
+    response = `${summary.summary} You can ask me about progress, files, build status, or tell me to pause/stop/continue.`;
+  }
+
+  taskStore.emitEvent(taskId, { type: 'conversation', role: 'user', message });
+  taskStore.emitEvent(taskId, { type: 'conversation', role: 'osiri', message: response });
+
+  res.json({ taskId, response, taskStatus: task.status, phase: task.phase });
 });
 
 // --- Error handler for unknown routes ---

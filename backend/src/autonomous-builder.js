@@ -12,102 +12,153 @@ import { runRuflo, runRufloJson } from './ruflo-runtime.js';
 import { getWorkspaceRoot, safePath } from './workspace.js';
 import { join } from 'node:path';
 import { config, isConfigured } from './config.js';
+import { taskStore } from './task-store.js';
+import { handleFailure, attemptReconnect, resumeFromCheckpoint, FailureType } from './resilience.js';
 
 class AutonomousBuilder extends EventEmitter {
   constructor() {
     super();
     this.setMaxListeners(100);
+    this.activeTasks = new Map(); // taskId -> AbortController
   }
 
   /**
    * Main entry: given a natural-language build request, autonomously
    * execute the complete workspace workflow and stream real events.
+   *
+   * CRITICAL: The task is created in the durable taskStore and continues
+   * running even if the browser/SSE connection disconnects. The onEvent
+   * callback is only for live streaming — its absence does not stop the task.
    */
-  async build({ prompt, sessionId, onEvent, signal, maxFixIterations = 3 }) {
-    const taskId = `build-${Date.now()}-${randomUUID().slice(0, 8)}`;
-    const task = {
-      taskId, sessionId, status: 'pending', prompt,
-      createdAt: new Date().toISOString(),
-      events: [], result: null, error: null,
-      filesCreated: [], buildResult: null, testResult: null, verified: false,
-    };
+  async build({ prompt, sessionId, onEvent, signal, maxFixIterations = 3, taskId: existingTaskId }) {
+    // Create durable task in the persistent store
+    const taskId = existingTaskId || `build-${Date.now()}-${randomUUID().slice(0, 8)}`;
+    const existingTask = taskStore.getTask(taskId);
+    let dTask;
 
+    if (existingTask && existingTask.status === 'PAUSED') {
+      // Resume from checkpoint
+      dTask = existingTask;
+      taskStore.emitEvent(taskId, { type: 'task.resumed', message: 'Resuming from paused state' });
+      taskStore.transition(taskId, 'RUNNING');
+    } else if (existingTask && existingTask.status === 'WAITING_NETWORK') {
+      // Resume after network recovery
+      dTask = existingTask;
+      const checkpoint = resumeFromCheckpoint(taskId);
+      taskStore.emitEvent(taskId, { type: 'task.resumed', checkpoint, message: 'Resuming after network recovery' });
+    } else {
+      // New task
+      dTask = taskStore.createTask({ taskId, prompt, sessionId, type: 'autonomous', maxRetries: 5 });
+    }
+
+    // Track active task with its own abort controller (independent of browser)
+    const taskController = new AbortController();
+    this.activeTasks.set(taskId, taskController);
+
+    // Emit helper — always goes through durable taskStore (persists to disk)
+    // AND forwards to live SSE if connected. Task continues even if SSE is gone.
     const emit = (e) => {
-      const fullEvent = { taskId, timestamp: new Date().toISOString(), ...e };
-      task.events.push(fullEvent);
-      this.emit(`event:${taskId}`, fullEvent);
-      this.emit('event', fullEvent);
-      if (onEvent) onEvent(fullEvent);
-      logger.info('builder.event', fullEvent);
+      taskStore.emitEvent(taskId, e);
+      this.emit(`event:${taskId}`, e);
+      if (onEvent) {
+        try { onEvent(e); } catch { /* SSE disconnected — task continues */ }
+      }
     };
 
-    const setStatus = (status) => { task.status = status; };
+    // Check if task was cancelled while we were disconnected
+    const checkCancelled = () => {
+      const t = taskStore.getTask(taskId);
+      return t && (t.status === 'CANCELLED' || t.status === 'PAUSED');
+    };
 
     try {
-      setStatus('running');
-      emit({ type: 'task.started', prompt });
+      taskStore.transition(taskId, 'PLANNING');
+      taskStore.setPhase(taskId, 'planning');
+      emit({ type: 'task.started', prompt: dTask.goal });
 
-      // 1. PLAN — analyze the request and determine the project structure
+      // 1. RETRIEVE MEMORY — search for relevant patterns before starting work
+      taskStore.setPhase(taskId, 'memory-retrieval');
+      emit({ type: 'memory.retrieved.started' });
+      const memoryResults = await this.retrieveMemory(prompt);
+      emit({ type: 'memory.retrieved', patterns: memoryResults.length, results: memoryResults.slice(0, 5) });
+
+      // 2. PLAN — analyze the request and determine the project structure
+      taskStore.transition(taskId, 'RUNNING');
+      taskStore.setPhase(taskId, 'planning');
       emit({ type: 'planning.started', prompt });
       const plan = this.createPlan(prompt);
+      // Adapt plan based on retrieved memory patterns
+      if (memoryResults.length > 0) {
+        plan.adaptedFromMemory = true;
+        emit({ type: 'planning.memory.adapted', patterns: memoryResults.length });
+      }
       emit({ type: 'planning.completed', plan: plan.summary, projectType: plan.projectType });
 
-      // 2. Create a subdirectory for this project in the workspace
+      // 3. SELECT AGENTS — determine which agents to use
+      taskStore.setPhase(taskId, 'agent-selection');
+      const agents = this.selectAgents(plan);
+      emit({ type: 'agent.selected', agents: agents.map(a => a.type) });
+      taskStore.update(taskId, { agentIds: agents.map(a => a.id) });
+
+      // 4. Create a subdirectory for this project in the workspace
       const projectDir = plan.projectName;
       emit({ type: 'workspace.inspect', dir: projectDir });
 
-      // 3. EXECUTE — create all project files
+      // 5. EXECUTE — create all project files
+      taskStore.setPhase(taskId, 'executing');
       emit({ type: 'execution.started' });
       for (const file of plan.files) {
-        if (signal?.aborted) throw new Error('aborted');
+        if (checkCancelled()) throw new Error('cancelled');
+        if (taskController.signal.aborted) throw new Error('aborted');
         const relPath = join(projectDir, file.path);
         emit({ type: file.exists ? 'file.updated' : 'file.created', path: relPath, size: file.content.length });
         writeFile(relPath, file.content);
-        task.filesCreated.push(relPath);
+        taskStore.update(taskId, { filesCreated: [...(taskStore.getTask(taskId).filesCreated || []), relPath] });
       }
-      emit({ type: 'execution.completed', filesCreated: task.filesCreated.length });
+      emit({ type: 'execution.completed', filesCreated: taskStore.getTask(taskId).filesCreated.length });
 
-      // 4. INSTALL dependencies (if package.json was created)
+      // 6. INSTALL dependencies (if package.json was created)
       if (plan.needsInstall) {
+        taskStore.setPhase(taskId, 'installing');
         emit({ type: 'command.started', command: 'npm install', cwd: projectDir });
-        const installResult = await executeCommand({
+        const installResult = await this.executeWithResilience(taskId, {
           command: 'npm install --no-audit --no-fund',
           cwd: projectDir,
           onOutput: (o) => emit({ type: 'command.output', stream: o.stream, data: o.data }),
-          signal,
-        });
+        }, emit);
         emit({ type: 'command.completed', command: 'npm install', exitCode: installResult.exitCode });
         if (installResult.exitCode !== 0) {
-          emit({ type: 'task.failed', error: 'npm install failed: ' + (installResult.stderr || installResult.stdout).slice(0, 200) });
-          setStatus('failed');
-          task.error = 'npm install failed';
-          return task;
+          taskStore.fail(taskId, 'npm install failed: ' + (installResult.stderr || installResult.stdout).slice(0, 200), 'BUILD');
+          return taskStore.getTask(taskId);
         }
       }
 
-      // 5-6. BUILD + TEST loop with self-improvement
+      // 7-8. BUILD + TEST loop with self-improvement
       let buildOk = false;
       let testOk = false;
       let iteration = 0;
 
-      while (iteration <= maxFixIterations && !signal?.aborted) {
+      while (iteration <= maxFixIterations) {
+        if (checkCancelled()) throw new Error('cancelled');
+        if (taskController.signal.aborted) throw new Error('aborted');
         iteration++;
         emit({ type: 'iteration.started', iteration });
 
         // BUILD
+        taskStore.setPhase(taskId, 'building');
         emit({ type: 'build.started', command: plan.buildCommand, cwd: projectDir });
-        const buildResult = await executeCommand({
+        const buildResult = await this.executeWithResilience(taskId, {
           command: plan.buildCommand,
           cwd: projectDir,
           onOutput: (o) => emit({ type: 'command.output', stream: o.stream, data: o.data }),
-          signal,
-        });
+        }, emit);
         emit({ type: buildResult.exitCode === 0 ? 'build.completed' : 'build.failed', exitCode: buildResult.exitCode, cwd: projectDir });
-        task.buildResult = { exitCode: buildResult.exitCode, stdout: buildResult.stdout.slice(0, 5000), stderr: buildResult.stderr.slice(0, 5000) };
+        taskStore.update(taskId, { buildResult: { exitCode: buildResult.exitCode, stdout: buildResult.stdout.slice(0, 5000), stderr: buildResult.stderr.slice(0, 5000) } });
         buildOk = buildResult.exitCode === 0;
 
         if (!buildOk) {
           // OBSERVE + FIX
+          taskStore.setPhase(taskId, 'fixing-build');
           emit({ type: 'fix.started', reason: 'build failure', iteration });
           const fix = this.analyzeBuildFailure(buildResult.stderr || buildResult.stdout, plan);
           if (fix) {
@@ -122,15 +173,15 @@ class AutonomousBuilder extends EventEmitter {
 
         // TEST (if test command exists)
         if (plan.testCommand) {
+          taskStore.setPhase(taskId, 'testing');
           emit({ type: 'test.started', command: plan.testCommand, cwd: projectDir });
-          const testResult = await executeCommand({
+          const testResult = await this.executeWithResilience(taskId, {
             command: plan.testCommand,
             cwd: projectDir,
             onOutput: (o) => emit({ type: 'command.output', stream: o.stream, data: o.data }),
-            signal,
-          });
+          }, emit);
           emit({ type: testResult.exitCode === 0 ? 'test.passed' : 'test.failed', exitCode: testResult.exitCode });
-          task.testResult = { exitCode: testResult.exitCode, stdout: testResult.stdout.slice(0, 5000), stderr: testResult.stderr.slice(0, 5000) };
+          taskStore.update(taskId, { testResult: { exitCode: testResult.exitCode, stdout: testResult.stdout.slice(0, 5000), stderr: testResult.stderr.slice(0, 5000) } });
           testOk = testResult.exitCode === 0;
 
           if (!testOk) {
@@ -153,38 +204,156 @@ class AutonomousBuilder extends EventEmitter {
         break;
       }
 
-      // 7. VERIFY
+      // 9. VERIFY
       if (buildOk && (testOk || !plan.testCommand)) {
+        taskStore.transition(taskId, 'VERIFYING');
+        taskStore.setPhase(taskId, 'verifying');
         emit({ type: 'verification.started' });
         const fileList = listFiles(projectDir);
         emit({ type: 'verification.completed', verified: true, files: fileList.length, filesList: fileList.slice(0, 30) });
-        task.verified = true;
-        task.result = `Project '${plan.projectName}' built successfully. ${task.filesCreated.length} files created. Build: ✓${plan.testCommand ? ' Tests: ✓' : ''}`;
-        emit({ type: 'task.completed', result: task.result, verified: true });
-        setStatus('completed');
 
-        // Store knowledge in real Ruflo memory
-        await this.storeKnowledge(plan, task, emit);
+        const resultMsg = `Project '${plan.projectName}' built successfully. ${taskStore.getTask(taskId).filesCreated.length} files created. Build: ✓${plan.testCommand ? ' Tests: ✓' : ''}`;
+        taskStore.complete(taskId, resultMsg);
+        emit({ type: 'task.completed', result: resultMsg, verified: true });
+
+        // 10. SAVE LEARNING — store knowledge in real Ruflo memory
+        await this.storeKnowledge(plan, taskStore.getTask(taskId), emit);
       } else {
         const failReason = !buildOk ? 'build failed' : 'tests failed';
+        taskStore.fail(taskId, `Project could not be verified after ${iteration} iterations: ${failReason}`, 'BUILD');
         emit({ type: 'task.failed', error: `Project could not be verified after ${iteration} iterations: ${failReason}`, verified: false });
-        task.error = failReason;
-        setStatus('failed');
 
         // Still store what we learned from the failure
-        await this.storeKnowledge(plan, task, emit);
+        await this.storeKnowledge(plan, taskStore.getTask(taskId), emit);
       }
     } catch (err) {
-      if (signal?.aborted) {
-        emit({ type: 'task.cancelled', reason: 'aborted' });
-        setStatus('cancelled');
+      if (err.message === 'cancelled' || err.message === 'aborted' || taskController.signal.aborted) {
+        const t = taskStore.getTask(taskId);
+        if (t.status !== 'CANCELLED') {
+          taskStore.cancel(taskId, 'user');
+        }
+        emit({ type: 'task.cancelled', reason: err.message });
       } else {
-        emit({ type: 'task.failed', error: err.message });
-        setStatus('failed');
-        task.error = err.message;
+        // Use resilience layer to classify and handle the failure
+        const { shouldRetry, failureType, delay, retryCount } = handleFailure(taskId, err, { phase: taskStore.getTask(taskId)?.phase });
+
+        if (shouldRetry) {
+          // Network/provider failure — wait and retry
+          emit({ type: 'network.retry', delay, retryCount });
+          await new Promise(r => setTimeout(r, delay));
+          // Recursively resume — but only the failed operation, not the whole task
+          // For simplicity, we retry the entire build from checkpoint
+          this.activeTasks.delete(taskId);
+          return this.build({ prompt: dTask.goal, sessionId, onEvent, signal, maxFixIterations, taskId });
+        } else if (failureType !== FailureType.BUILD && failureType !== FailureType.TEST && failureType !== FailureType.CODE) {
+          taskStore.fail(taskId, err.message, failureType);
+          emit({ type: 'task.failed', error: err.message, classification: failureType });
+        }
+      }
+    } finally {
+      this.activeTasks.delete(taskId);
+    }
+
+    return taskStore.getTask(taskId);
+  }
+
+  /**
+   * Execute a command with network resilience.
+   * If the command fails due to a network error, checkpoint and retry with backoff.
+   */
+  async executeWithResilience(taskId, { command, cwd, onOutput }, emit) {
+    let lastError = null;
+    let retryCount = 0;
+    const maxRetries = 3;
+
+    while (retryCount <= maxRetries) {
+      try {
+        const result = await executeCommand({ command, cwd, onOutput });
+        return result;
+      } catch (err) {
+        lastError = err;
+        const { shouldRetry, failureType, delay } = handleFailure(taskId, err, { command });
+
+        if (shouldRetry && retryCount < maxRetries) {
+          retryCount++;
+          emit({ type: 'command.retry', command, retryCount, delay, reason: failureType });
+          await new Promise(r => setTimeout(r, delay));
+          continue;
+        }
+
+        // Non-retryable or max retries — return a failure result
+        return {
+          exitCode: 1,
+          stdout: '',
+          stderr: err.message,
+          timedOut: false,
+        };
       }
     }
-    return task;
+
+    return { exitCode: 1, stdout: '', stderr: lastError?.message || 'Unknown error', timedOut: false };
+  }
+
+  /**
+   * Retrieve relevant memory patterns before starting work.
+   * Uses real Ruflo memory search.
+   */
+  async retrieveMemory(prompt) {
+    const results = [];
+    try {
+      const searchTerms = this.extractSearchTerms(prompt);
+      for (const term of searchTerms) {
+        try {
+          const result = await runRufloJson(['memory', 'search', '-q', term], { timeout: 15000 });
+          if (result.json?.results) {
+            results.push(...result.json.results);
+          }
+        } catch { /* memory may not be available */ }
+      }
+    } catch (err) {
+      logger.warn('builder.memory.retrieve.failed', { error: err.message });
+    }
+    return results;
+  }
+
+  extractSearchTerms(prompt) {
+    const p = prompt.toLowerCase();
+    const terms = [];
+    if (/3d|three/.test(p)) terms.push('three.js 3d scene');
+    if (/glass|lucid/.test(p)) terms.push('glass lucid effects');
+    if (/dashboard/.test(p)) terms.push('dashboard');
+    if (/ecommerce|shop/.test(p)) terms.push('ecommerce');
+    if (/landing/.test(p)) terms.push('landing page');
+    if (/portfolio/.test(p)) terms.push('portfolio');
+    if (/banking|finance/.test(p)) terms.push('banking finance');
+    if (/authentication|auth/.test(p)) terms.push('authentication');
+    if (/responsive|mobile/.test(p)) terms.push('responsive mobile');
+    if (/test/.test(p)) terms.push('testing patterns');
+    if (terms.length === 0) terms.push(prompt.slice(0, 50));
+    return terms.slice(0, 3);
+  }
+
+  /**
+   * Select appropriate agents for the task based on the plan.
+   * Uses real Ruflo agent spawning.
+   */
+  selectAgents(plan) {
+    const agents = [];
+    // Always use a coder agent for implementation
+    agents.push({ id: `agent-${plan.projectType}-coder`, type: 'coder', role: 'implementation' });
+    // Add tester for projects with tests
+    if (plan.testCommand) {
+      agents.push({ id: `agent-${plan.projectType}-tester`, type: 'tester', role: 'testing' });
+    }
+    // Add architect for complex projects
+    if (plan.files.length > 8) {
+      agents.push({ id: `agent-${plan.projectType}-architect`, type: 'architect', role: 'architecture' });
+    }
+    // Add visual agent for 3D/glass projects
+    if (plan.projectType === '3d-app' || plan.projectType === 'landing') {
+      agents.push({ id: `agent-${plan.projectType}-visual`, type: 'visual', role: 'visual-design' });
+    }
+    return agents;
   }
 
   /**

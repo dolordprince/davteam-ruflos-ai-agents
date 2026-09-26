@@ -8,6 +8,9 @@ secrets/
 .claude/sessions/
 .claude/projects/
 
+# Durable task store (contains task state and event logs)
+workspace/.task-store/
+
 # Dependencies
 node_modules/
 
