@@ -1,0 +1,14 @@
+node_modules
+.git
+*.log
+.env
+.env.*
+*.key
+*.pem
+secrets/
+.swarm/
+*.rvf
+*.rvf.lock
+agentdb.rvf*
+upstream-ruflo/
+.tmp/

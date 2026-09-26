@@ -1,0 +1,38 @@
+# Secrets — never commit
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+secrets/
+.claude/sessions/
+.claude/projects/
+
+# Dependencies
+node_modules/
+
+# Build output
+frontend/dist/
+backend/dist/
+
+# Runtime artifacts
+.swarm/
+.claude/*.db
+*.rvf
+*.rvf.lock
+agentdb.rvf
+agentdb.rvf.lock
+
+# Logs
+*.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.claude-flow/

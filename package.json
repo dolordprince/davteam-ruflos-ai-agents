@@ -1,0 +1,43 @@
+{
+  "name": "davteam-ruflos-ai-agents",
+  "version": "1.0.0",
+  "private": true,
+  "description": "DavTeam Ruflos AI Agents — production HTTP backend + Osiri frontend around the real Ruflo runtime (ruvnet/ruflo)",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "dev": "node backend/src/server.js",
+    "start": "node backend/src/server.js",
+    "build:frontend": "node scripts/build-frontend.js",
+    "build:backend": "echo \"backend is JS-only, no build step\"",
+    "build": "npm run build:frontend && npm run build:backend",
+    "test": "node backend/src/test-runner.js",
+    "version:check": "node backend/src/check-ruflo.js"
+  },
+  "dependencies": {
+    "ruflo": "3.45.0",
+    "express": ">=4.22.2",
+    "cors": "^2.8.5",
+    "express-rate-limit": ">=8.4.1",
+    "helmet": "^7.2.0",
+    "ws": ">=8.21.0"
+  },
+  "author": "DavTeam",
+  "license": "MIT",
+  "homepage": "https://github.com/dolordprince/davteam-ruflos-ai-agents",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dolordprince/davteam-ruflos-ai-agents.git"
+  },
+  "keywords": [
+    "ruflo",
+    "ai-agents",
+    "osiri",
+    "davteam",
+    "mcp",
+    "swarm",
+    "orchestration"
+  ]
+}

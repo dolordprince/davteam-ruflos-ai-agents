@@ -1,0 +1,403 @@
+// backend/src/routes.js — API route handlers exposing real Ruflo functionality.
+import { Router } from 'express';
+import { randomUUID } from 'node:crypto';
+import { logger } from './logger.js';
+import { config, isConfigured } from './config.js';
+import {
+  rufloAvailable, getRufloVersion, runRuflo, runRufloJson,
+  runDoctor, getCapabilities,
+} from './ruflo-runtime.js';
+import { taskManager } from './task-manager.js';
+import { executeCommand } from './command-exec.js';
+import { safePath, validateCommand, auditLog, PathValidationError, CommandValidationError } from './workspace.js';
+import { listProviders, listModels, chatCompletion, ProviderError } from './provider.js';
+
+const router = Router();
+
+// --- Helpers ---
+
+function apiError(res, code, message, status = 500, extra = {}) {
+  logger.error('api.error', { code, message, ...extra });
+  res.status(status).json({ error: { code, message, ...extra } });
+}
+
+// --- Health & version ---
+
+router.get('/health', async (req, res) => {
+  const ver = await getRufloVersion();
+  res.json({
+    status: rufloAvailable ? 'ok' : 'degraded',
+    service: 'davteam-ruflos-ai-agents',
+    ruflo: rufloAvailable,
+    rufloVersion: ver.version,
+    osiri: true,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+router.get('/api/health', async (req, res) => {
+  const ver = await getRufloVersion();
+  const caps = await getCapabilities();
+  res.json({
+    status: rufloAvailable ? 'ok' : 'degraded',
+    service: 'davteam-ruflos-ai-agents',
+    ruflo: rufloAvailable,
+    rufloVersion: ver.version,
+    osiri: true,
+    capabilities: caps,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+router.get('/api/version', async (req, res) => {
+  const ver = await getRufloVersion();
+  res.json({
+    service: 'davteam-ruflos-ai-agents',
+    version: '1.0.0',
+    ruflo: {
+      version: ver.version,
+      available: rufloAvailable,
+    },
+    node: process.version,
+  });
+});
+
+router.get('/api/capabilities', async (req, res) => {
+  const caps = await getCapabilities();
+  const configured = isConfigured();
+  res.json({
+    ...caps,
+    modelProviders: configured,
+    workspace: config.workspace,
+    streaming: true,
+    security: { workspaceIsolation: true, pathValidation: true, commandValidation: true },
+  });
+});
+
+// --- Models ---
+
+router.get('/api/models', (req, res) => {
+  // Never expose API keys
+  res.json({ models: listModels(), providers: listProviders() });
+});
+
+// --- Chat (direct model proxy, server-side credentials only) ---
+
+router.post('/api/chat', async (req, res) => {
+  const { messages, model, stream } = req.body || {};
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return apiError(res, 'INVALID_REQUEST', 'messages array is required', 400);
+  }
+  try {
+    if (stream) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      res.write(`data: ${JSON.stringify({ type: 'chat.started', model: model || config.modelName })}\n\n`);
+      const result = await chatCompletion({
+        messages, model,
+        onToken: (token) => res.write(`data: ${JSON.stringify({ type: 'chat.token', token })}\n\n`),
+      });
+      res.write(`data: ${JSON.stringify({ type: 'chat.done', model: result.model })}\n\n`);
+      res.end();
+    } else {
+      const result = await chatCompletion({ messages, model });
+      res.json({ content: result.content, model: result.model, usage: result.usage });
+    }
+  } catch (err) {
+    if (err instanceof ProviderError) {
+      return apiError(res, err.code, err.message, 502, { details: err.details });
+    }
+    return apiError(res, 'CHAT_FAILED', err.message, 500);
+  }
+});
+
+// --- Agents ---
+
+router.get('/api/agents', async (req, res) => {
+  try {
+    const result = await runRufloJson(['agent', 'list'], { timeout: 30000 });
+    res.json(result.json || { agents: [], total: 0 });
+  } catch (err) {
+    apiError(res, 'AGENTS_LIST_FAILED', err.message, 500);
+  }
+});
+
+router.post('/api/agents/spawn', async (req, res) => {
+  const { type = 'coder' } = req.body || {};
+  try {
+    const result = await runRufloJson(['agent', 'spawn', '-t', type], { timeout: 30000 });
+    if (result.exitCode !== 0 && !result.json) {
+      return apiError(res, 'AGENT_SPAWN_FAILED', result.stderr || 'Spawn failed', 500);
+    }
+    res.json(result.json || { success: false, stderr: result.stderr });
+  } catch (err) {
+    apiError(res, 'AGENT_SPAWN_FAILED', err.message, 500);
+  }
+});
+
+router.post('/api/agent/run', async (req, res) => {
+  const { prompt, agentType = 'coder', sessionId } = req.body || {};
+  if (!prompt) return apiError(res, 'INVALID_REQUEST', 'prompt is required', 400);
+  try {
+    const task = await taskManager.runAgentTask({ prompt, agentType, sessionId });
+    res.json(task);
+  } catch (err) {
+    apiError(res, 'AGENT_RUN_FAILED', err.message, 500);
+  }
+});
+
+// --- Tasks ---
+
+router.post('/api/task', async (req, res) => {
+  const { prompt, agentType, sessionId, type } = req.body || {};
+  if (!prompt) return apiError(res, 'INVALID_REQUEST', 'prompt is required', 400);
+  try {
+    const task = await taskManager.runAgentTask({ prompt, agentType, sessionId });
+    res.json(task);
+  } catch (err) {
+    apiError(res, 'TASK_FAILED', err.message, 500, {});
+  }
+});
+
+router.get('/api/tasks/:id', (req, res) => {
+  const task = taskManager.getTask(req.params.id);
+  if (!task) return apiError(res, 'TASK_NOT_FOUND', `Task ${req.params.id} not found`, 404);
+  res.json(task);
+});
+
+// --- Swarm ---
+
+router.post('/api/swarm', async (req, res) => {
+  const { objective, strategy = 'development', agents = 3 } = req.body || {};
+  if (!objective) return apiError(res, 'INVALID_REQUEST', 'objective is required', 400);
+  try {
+    // Initialize swarm then start it — real Ruflo commands
+    await runRuflo(['swarm', 'init', '--v3-mode'], { timeout: 30000 });
+    const result = await runRuflo(
+      ['swarm', 'start', '-o', objective, '-s', strategy],
+      { timeout: 60000 }
+    );
+    res.json({
+      success: result.exitCode === 0,
+      objective,
+      strategy,
+      agents,
+      output: result.stdout,
+      exitCode: result.exitCode,
+    });
+  } catch (err) {
+    apiError(res, 'SWARM_FAILED', err.message, 500);
+  }
+});
+
+router.get('/api/swarm/:id', async (req, res) => {
+  try {
+    const result = await runRufloJson(['swarm', 'status'], { timeout: 30000 });
+    res.json(result.json || { status: result.stdout, exitCode: result.exitCode });
+  } catch (err) {
+    apiError(res, 'SWARM_STATUS_FAILED', err.message, 500);
+  }
+});
+
+// --- Memory ---
+
+router.post('/api/memory/search', async (req, res) => {
+  const { query, namespace } = req.body || {};
+  if (!query) return apiError(res, 'INVALID_REQUEST', 'query is required', 400);
+  try {
+    const args = ['memory', 'search', '-q', query];
+    if (namespace) args.push('--namespace', namespace);
+    const result = await runRufloJson(args, { timeout: 60000 });
+    res.json(result.json || { results: [], stdout: result.stdout, exitCode: result.exitCode });
+  } catch (err) {
+    apiError(res, 'MEMORY_SEARCH_FAILED', err.message, 500);
+  }
+});
+
+router.post('/api/memory/store', async (req, res) => {
+  const { key, value, namespace } = req.body || {};
+  if (!key || value === undefined) return apiError(res, 'INVALID_REQUEST', 'key and value are required', 400);
+  try {
+    const args = ['memory', 'store', '-k', key, '-v', String(value)];
+    if (namespace) args.push('--namespace', namespace);
+    const result = await runRufloJson(args, { timeout: 30000 });
+    res.json(result.json || { success: result.exitCode === 0, exitCode: result.exitCode });
+  } catch (err) {
+    apiError(res, 'MEMORY_STORE_FAILED', err.message, 500);
+  }
+});
+
+// --- Tools ---
+
+router.get('/api/tools', async (req, res) => {
+  try {
+    const result = await runRufloJson(['mcp', 'tools'], { timeout: 30000 });
+    res.json(result.json || { tools: [], stdout: result.stdout, exitCode: result.exitCode });
+  } catch (err) {
+    apiError(res, 'TOOLS_LIST_FAILED', err.message, 500);
+  }
+});
+
+router.post('/api/tools/execute', async (req, res) => {
+  const { tool, args = {} } = req.body || {};
+  if (!tool) return apiError(res, 'INVALID_REQUEST', 'tool is required', 400);
+  try {
+    const cliArgs = ['mcp', 'exec', tool];
+    for (const [k, v] of Object.entries(args)) {
+      cliArgs.push(`--${k}`, String(v));
+    }
+    const result = await runRufloJson(cliArgs, { timeout: 60000 });
+    res.json(result.json || { result: result.stdout, exitCode: result.exitCode });
+  } catch (err) {
+    apiError(res, 'TOOL_EXECUTE_FAILED', err.message, 500);
+  }
+});
+
+// --- MetaHarness ---
+
+router.get('/api/metaharness/status', async (req, res) => {
+  try {
+    const result = await runDoctor('metaharness');
+    const available = result.exitCode === 0 && /pass/i.test(result.stdout);
+    res.json({
+      available,
+      exitCode: result.exitCode,
+      output: result.stdout,
+    });
+  } catch (err) {
+    res.json({ available: false, error: err.message });
+  }
+});
+
+function metaharnessEndpoint(subcommand, resField) {
+  return async (req, res) => {
+    const { path = '.' } = req.body || {};
+    try {
+      const result = await runRuflo(['metaharness', '--subcommand', subcommand, '--path', path], { timeout: 90000 });
+      res.json({
+        subcommand,
+        exitCode: result.exitCode,
+        [resField || 'output']: result.stdout,
+        stderr: result.stderr,
+      });
+    } catch (err) {
+      apiError(res, 'METAHARNESS_FAILED', err.message, 500);
+    }
+  };
+}
+
+router.post('/api/metaharness/score', metaharnessEndpoint('score', 'score'));
+router.post('/api/metaharness/genome', metaharnessEndpoint('genome', 'genome'));
+router.post('/api/metaharness/audit', metaharnessEndpoint('oia-audit', 'audit'));
+router.post('/api/metaharness/mcp-scan', metaharnessEndpoint('mcp-scan', 'scan'));
+router.post('/api/metaharness/threat-model', metaharnessEndpoint('threat-model', 'threatModel'));
+router.post('/api/metaharness/similarity', metaharnessEndpoint('similarity', 'similarity'));
+
+// --- Build / Test / Command ---
+
+router.post('/api/build', async (req, res) => {
+  const { command = 'npm run build', cwd, sessionId } = req.body || {};
+  try {
+    const task = await taskManager.runBuildTask({ command, cwd, sessionId });
+    res.json(task);
+  } catch (err) {
+    apiError(res, 'BUILD_FAILED', err.message, 500);
+  }
+});
+
+router.post('/api/test', async (req, res) => {
+  const { command = 'npm test', cwd, sessionId } = req.body || {};
+  try {
+    const task = await taskManager.runTestTask({ command, cwd, sessionId });
+    res.json(task);
+  } catch (err) {
+    apiError(res, 'TEST_FAILED', err.message, 500);
+  }
+});
+
+router.post('/api/command', async (req, res) => {
+  const { command, cwd } = req.body || {};
+  if (!command) return apiError(res, 'INVALID_REQUEST', 'command is required', 400);
+  try {
+    const result = await executeCommand({ command, cwd });
+    res.json(result);
+  } catch (err) {
+    if (err instanceof CommandValidationError || err instanceof PathValidationError) {
+      return apiError(res, err.code, err.message, 400);
+    }
+    apiError(res, 'COMMAND_FAILED', err.message, 500);
+  }
+});
+
+// --- SSE streaming: start a streaming agent task via POST ---
+router.post('/api/agent/stream', async (req, res) => {
+  const { prompt, agentType = 'coder', sessionId } = req.body || {};
+  if (!prompt) {
+    return apiError(res, 'INVALID_REQUEST', 'prompt is required', 400);
+  }
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+
+  const task = taskManager.createTask({ prompt, type: 'agent', sessionId });
+  res.write(`data: ${JSON.stringify({ type: 'task.created', taskId: task.taskId })}\n\n`);
+
+  taskManager.runAgentTask({
+    prompt, agentType, sessionId, taskId: task.taskId,
+    onEvent: (e) => {
+      res.write(`data: ${JSON.stringify(e)}\n\n`);
+      if (e.type === 'task.completed' || e.type === 'task.failed' || e.type === 'task.cancelled') {
+        res.write(`event: close\ndata: ${JSON.stringify({ type: 'stream.closed' })}\n\n`);
+        res.end();
+      }
+    },
+  }).catch((err) => {
+    res.write(`data: ${JSON.stringify({ type: 'task.failed', error: err.message })}\n\n`);
+    res.end();
+  });
+});
+
+// --- SSE streaming: subscribe to an existing task by taskId ---
+router.get('/api/task/stream', (req, res) => {
+  const taskId = req.query.taskId || req.query.id;
+  if (!taskId) {
+    return apiError(res, 'INVALID_REQUEST', 'taskId query param required', 400);
+  }
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+
+  const task = taskManager.getTask(taskId);
+  if (task) {
+    for (const e of task.events) {
+      res.write(`data: ${JSON.stringify(e)}\n\n`);
+    }
+    if (['completed', 'failed', 'cancelled'].includes(task.status)) {
+      res.write(`event: close\ndata: ${JSON.stringify({ type: 'stream.closed', status: task.status })}\n\n`);
+      res.end();
+      return;
+    }
+  }
+
+  const onEvent = (event) => {
+    if (event.taskId === taskId) {
+      res.write(`data: ${JSON.stringify(event)}\n\n`);
+      if (['task.completed', 'task.failed', 'task.cancelled'].includes(event.type)) {
+        res.write(`event: close\ndata: ${JSON.stringify({ type: 'stream.closed', status: event.type })}\n\n`);
+        res.end();
+      }
+    }
+  };
+  taskManager.on('event', onEvent);
+  req.on('close', () => taskManager.off('event', onEvent));
+});
+
+// --- Error handler for unknown routes ---
+router.use((req, res) => {
+  apiError(res, 'NOT_FOUND', `Route not found: ${req.method} ${req.path}`, 404);
+});
+
+export { router as apiRouter };
