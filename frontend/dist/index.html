@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#070a12">
+  <meta name="description" content="DAVTEAM RUFLOS AI AGENTS — Osiri Workspace">
+  <title>DAVTEAM RUFLOS AI AGENTS</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div id="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">D</div>
+        <div>
+          <strong>DAVTEAM</strong>
+          <span>RUFLOS AI</span>
+        </div>
+      </div>
+
+      <button id="newTask" class="primary">＋ New Task</button>
+
+      <nav>
+        <button class="nav active" data-panel="workspace">Workspace</button>
+        <button class="nav" data-panel="activity">Activity</button>
+        <button class="nav" data-panel="memory">Memory</button>
+        <button class="nav" data-panel="agents">Agents</button>
+      </nav>
+
+      <div class="status-card">
+        <span class="dot"></span>
+        <div>
+          <b id="runtimeStatus">Connecting…</b>
+          <small>Ruflo runtime</small>
+        </div>
+      </div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <div>
+          <span class="eyebrow">OSIRI INTELLIGENCE</span>
+          <h1>Autonomous Workspace</h1>
+        </div>
+        <div class="top-actions">
+          <button id="refresh">Refresh</button>
+          <button id="health">Health</button>
+        </div>
+      </header>
+
+      <section id="workspace" class="panel active">
+        <div class="hero">
+          <div>
+            <span class="eyebrow">BUILD • TEST • VERIFY • REPAIR</span>
+            <h2>What should I build?</h2>
+            <p>Osiri coordinates the Ruflo runtime, tools, memory and verification pipeline.</p>
+          </div>
+        </div>
+
+        <form id="taskForm" class="composer">
+          <textarea id="goal" required
+            placeholder="Build a responsive calculator with a glass interface, test it, verify it in a browser, and repair any failures."></textarea>
+
+          <div class="composer-row">
+            <div class="chips">
+              <span>Ruflo</span>
+              <span>Osiri</span>
+              <span>Browser verification</span>
+              <span>Auto repair</span>
+            </div>
+            <button class="primary" type="submit">Run Agent →</button>
+          </div>
+        </form>
+
+        <div class="task-controls">
+          <button id="pause">Pause</button>
+          <button id="resume">Resume</button>
+          <button id="cancel">Cancel</button>
+        </div>
+
+        <div class="grid">
+          <article class="card">
+            <div class="card-head">
+              <b>Task</b>
+              <span id="taskState">Idle</span>
+            </div>
+            <pre id="taskOutput">Waiting for a task…</pre>
+          </article>
+
+          <article class="card">
+            <div class="card-head">
+              <b>Pipeline</b>
+              <span id="pipelineState">Ready</span>
+            </div>
+            <div id="pipeline" class="pipeline"></div>
+          </article>
+        </div>
+      </section>
+
+      <section id="activity" class="panel">
+        <div class="section-head">
+          <h2>Activity</h2>
+          <button id="clearActivity">Clear</button>
+        </div>
+        <div id="activityLog" class="activity-log"></div>
+      </section>
+
+      <section id="memory" class="panel">
+        <div class="section-head">
+          <h2>Memory</h2>
+        </div>
+        <pre id="memoryOutput">Loading memory…</pre>
+      </section>
+
+      <section id="agents" class="panel">
+        <div class="section-head">
+          <h2>Agents & Tools</h2>
+        </div>
+        <div id="agentsOutput" class="agent-list">Loading runtime capabilities…</div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
